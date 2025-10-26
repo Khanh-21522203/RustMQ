@@ -1,0 +1,326 @@
+syntax = "proto3";
+
+package api;
+
+// Kafka Broker Service
+service KafkaBroker {
+  // Topic Management
+  rpc GetTopicMetadata(TopicMetadataRequest) returns (TopicMetadataResponse);
+
+  // Producer Operations
+  rpc Produce(ProduceRequest) returns (ProduceResponse);
+
+  // Consumer Operations
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+  rpc ListOffsets(ListOffsetsRequest) returns (ListOffsetsResponse);
+
+  // Consumer Group Coordination
+  rpc FindCoordinator(GroupCoordinatorRequest) returns (GroupCoordinatorResponse);
+  rpc JoinGroup(JoinGroupRequest) returns (JoinGroupResponse);
+  rpc SyncGroup(SyncGroupRequest) returns (SyncGroupResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc LeaveGroup(LeaveGroupRequest) returns (LeaveGroupResponse);
+
+  // Offset Management
+  rpc CommitOffset(OffsetCommitRequest) returns (OffsetCommitResponse);
+  rpc FetchOffset(OffsetFetchRequest) returns (OffsetFetchResponse);
+}
+
+// ==================== TOPIC METADATA ====================
+
+message TopicMetadataRequest {
+  repeated string topics = 1;
+}
+
+message TopicMetadataResponse {
+  repeated Broker brokers = 1;
+  repeated TopicMetadata topics = 2;
+
+  message Broker {
+    int32 node_id = 1;
+    string host = 2;
+    int32 port = 3;
+  }
+
+  message TopicMetadata {
+    int32 topic_error_code = 1;
+    string topic_name = 2;
+    repeated PartitionMetadata partitions = 3;
+  }
+
+  message PartitionMetadata {
+    int32 partition_error_code = 1;
+    int32 partition_id = 2;
+    int32 leader = 3;
+    repeated int32 replicas = 4;
+    repeated int32 isr = 5;  // In-Sync Replicas
+  }
+}
+
+// ==================== PRODUCE ====================
+
+message ProduceRequest {
+  int32 required_acks = 1;  // -1=all, 0=none, 1=leader
+  int32 timeout_ms = 2;
+  repeated TopicData topics = 3;
+
+  message TopicData {
+    string topic_name = 1;
+    repeated PartitionData partitions = 2;
+  }
+
+  message PartitionData {
+    int32 partition = 1;
+    bytes message_set = 2;  // Serialized message set
+  }
+}
+
+message ProduceResponse {
+  repeated TopicResult results = 1;
+
+  message TopicResult {
+    string topic_name = 1;
+    repeated PartitionResult partitions = 2;
+  }
+
+  message PartitionResult {
+    int32 partition = 1;
+    int32 error_code = 2;
+    int64 offset = 3;  // Offset của message đã được ghi
+  }
+}
+
+// ==================== FETCH ====================
+
+message FetchRequest {
+  int32 replica_id = 1;  // -1 cho consumer
+  int32 max_wait_time = 2;  // Max time to wait (ms)
+  int32 min_bytes = 3;  // Min bytes để response
+  repeated TopicData topics = 4;
+
+  message TopicData {
+    string topic_name = 1;
+    repeated PartitionData partitions = 2;
+  }
+
+  message PartitionData {
+    int32 partition = 1;
+    int64 fetch_offset = 2;
+    int32 max_bytes = 3;
+  }
+}
+
+message FetchResponse {
+  repeated TopicResult topics = 1;
+
+  message TopicResult {
+    string topic_name = 1;
+    repeated PartitionResult partitions = 2;
+  }
+
+  message PartitionResult {
+    int32 partition = 1;
+    int32 error_code = 2;
+    int64 high_watermark_offset = 3;
+    int32 message_set_size = 4;
+    bytes message_set = 5;
+  }
+}
+
+// ==================== LIST OFFSETS ====================
+
+message ListOffsetsRequest {
+  int32 replica_id = 1;
+  repeated TopicData topics = 2;
+
+  message TopicData {
+    string topic_name = 1;
+    repeated PartitionData partitions = 2;
+  }
+
+  message PartitionData {
+    int32 partition = 1;
+    int64 time = 2;  // -1=latest, -2=earliest
+    int32 max_number_of_offsets = 3;
+  }
+}
+
+message ListOffsetsResponse {
+  repeated TopicResult topics = 1;
+
+  message TopicResult {
+    string topic_name = 1;
+    repeated PartitionOffsets partitions = 2;
+  }
+
+  message PartitionOffsets {
+    int32 partition = 1;
+    int32 error_code = 2;
+    repeated int64 offsets = 3;
+  }
+}
+
+// ==================== GROUP COORDINATOR ====================
+
+message GroupCoordinatorRequest {
+  string group_id = 1;
+}
+
+message GroupCoordinatorResponse {
+  int32 error_code = 1;
+  int32 coordinator_id = 2;
+  string coordinator_host = 3;
+  int32 coordinator_port = 4;
+}
+
+// ==================== JOIN GROUP ====================
+
+message JoinGroupRequest {
+  string group_id = 1;
+  int32 session_timeout = 2;
+  string member_id = 3;
+  string protocol_type = 4;
+  repeated GroupProtocol group_protocols = 5;
+
+  message GroupProtocol {
+    string protocol_name = 1;
+    bytes protocol_metadata = 2;
+  }
+}
+
+message JoinGroupResponse {
+  int32 error_code = 1;
+  int32 generation_id = 2;
+  string group_protocol = 3;
+  string leader_id = 4;
+  string member_id = 5;
+  repeated Member members = 6;
+
+  message Member {
+    string member_id = 1;
+    bytes member_metadata = 2;
+  }
+}
+
+// ==================== SYNC GROUP ====================
+
+message SyncGroupRequest {
+  string group_id = 1;
+  int32 generation_id = 2;
+  string member_id = 3;
+  repeated Assignment group_assignment = 4;
+
+  message Assignment {
+    string member_id = 1;
+    bytes member_assignment = 2;
+  }
+}
+
+message SyncGroupResponse {
+  int32 error_code = 1;
+  bytes member_assignment = 2;
+}
+
+// ==================== HEARTBEAT ====================
+
+message HeartbeatRequest {
+  string group_id = 1;
+  int32 generation_id = 2;
+  string member_id = 3;
+}
+
+message HeartbeatResponse {
+  int32 error_code = 1;  // 0=NoError, non-zero to signal rejoin
+}
+
+// ==================== LEAVE GROUP ====================
+
+message LeaveGroupRequest {
+  string group_id = 1;
+  string member_id = 2;
+}
+
+message LeaveGroupResponse {
+  int32 error_code = 1;
+}
+
+// ==================== OFFSET COMMIT ====================
+
+message OffsetCommitRequest {
+  string consumer_group_id = 1;
+  repeated TopicData topics = 2;
+
+  message TopicData {
+    string topic_name = 1;
+    repeated PartitionData partitions = 2;
+  }
+
+  message PartitionData {
+    int32 partition = 1;
+    int64 offset = 2;
+    string metadata = 3;
+  }
+}
+
+message OffsetCommitResponse {
+  repeated TopicResult topics = 1;
+
+  message TopicResult {
+    string topic_name = 1;
+    repeated PartitionResult partitions = 2;
+  }
+
+  message PartitionResult {
+    int32 partition = 1;
+    int32 error_code = 2;
+  }
+}
+
+// ==================== OFFSET FETCH ====================
+
+message OffsetFetchRequest {
+  string consumer_group = 1;
+  repeated TopicData topics = 2;
+
+  message TopicData {
+    string topic_name = 1;
+    repeated int32 partitions = 2;
+  }
+}
+
+message OffsetFetchResponse {
+  repeated TopicResult topics = 1;
+
+  message TopicResult {
+    string topic_name = 1;
+    repeated PartitionResult partitions = 2;
+  }
+
+  message PartitionResult {
+    int32 partition = 1;
+    int64 offset = 2;
+    string metadata = 3;
+    int32 error_code = 4;
+  }
+}
+
+// ==================== ERROR CODES ====================
+
+// Common Kafka Error Codes
+// 0   = NoError
+// -1  = Unknown
+// 1   = OffsetOutOfRange
+// 2   = InvalidMessage
+// 3   = UnknownTopicOrPartition
+// 5   = LeaderNotAvailable
+// 6   = NotLeaderForPartition
+// 14  = OffsetMetadataTooLarge
+// 15  = GroupLoadInProgress
+// 16  = GroupCoordinatorNotAvailable
+// 17  = NotCoordinatorForGroup
+// 22  = InvalidGroupId
+// 24  = UnknownMemberId
+// 25  = InvalidSessionTimeout
+// 27  = RebalanceInProgress
+
+// Reference: https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol

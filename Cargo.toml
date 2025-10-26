@@ -1,0 +1,13 @@
+[package]
+name = "Rust-MQ"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+log = "0.4.27"
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-util = "0.7"
+[build-dependencies]
+tonic-build = "0.12"
