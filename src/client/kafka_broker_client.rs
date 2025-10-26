@@ -14,27 +14,27 @@ pub struct KafkaBrokerClient {
 #[async_trait]
 pub trait KafkaBrokerClientTrait {
     async fn get_topic_metadata(&self, request: Request<TopicMetadataRequest>)
-        -> Result<Response<TopicMetadataResponse>, Status>;
+        -> Result<TopicMetadataResponse, Status>;
     async fn produce(&self, request: Request<ProduceRequest>)
-        -> Result<Response<ProduceResponse>, Status>;
+        -> Result<ProduceResponse, Status>;
     async fn fetch(&self, request: Request<FetchRequest>)
-        -> Result<Response<FetchResponse>, Status>;
+        -> Result<FetchResponse, Status>;
     async fn list_offsets(&self, request: Request<ListOffsetsRequest>)
-        -> Result<Response<ListOffsetsResponse>, Status>;
+        -> Result<ListOffsetsResponse, Status>;
     async fn find_coordinator(&self, request: Request<GroupCoordinatorRequest>)
-        -> Result<Response<GroupCoordinatorResponse>, Status>;
+        -> Result<GroupCoordinatorResponse, Status>;
     async fn join_group(&self, request: Request<JoinGroupRequest>)
-        -> Result<Response<JoinGroupResponse>, Status>;
+        -> Result<JoinGroupResponse, Status>;
     async fn sync_group(&self, request: Request<SyncGroupRequest>)
-        -> Result<Response<SyncGroupResponse>, Status>;
+        -> Result<SyncGroupResponse, Status>;
     async fn heartbeat(&self, request: Request<HeartbeatRequest>)
-        -> Result<Response<HeartbeatResponse>, Status>;
+        -> Result<HeartbeatResponse, Status>;
     async fn leave_group(&self, request: Request<LeaveGroupRequest>)
-        -> Result<Response<LeaveGroupResponse>, Status>;
+        -> Result<LeaveGroupResponse, Status>;
     async fn commit_offset(&self, request: Request<OffsetCommitRequest>)
-        -> Result<Response<OffsetCommitResponse>, Status>;
+        -> Result<OffsetCommitResponse, Status>;
     async fn fetch_offset(&self, request: Request<OffsetFetchRequest>)
-        -> Result<Response<OffsetFetchResponse>, Status>;
+        -> Result<OffsetFetchResponse, Status>;
 }
 
 impl KafkaBrokerClient {
@@ -52,47 +52,69 @@ impl KafkaBrokerClient {
 
 #[async_trait]
 impl KafkaBrokerClientTrait for KafkaBrokerClient {
-    async fn get_topic_metadata(&self, request: Request<TopicMetadataRequest>) -> Result<Response<TopicMetadataResponse>, Status> {
-        todo!()
+    async fn get_topic_metadata(&self, request: Request<TopicMetadataRequest>) -> Result<TopicMetadataResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.get_topic_metadata(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn produce(&self, request: Request<ProduceRequest>) -> Result<Response<ProduceResponse>, Status> {
-        todo!()
+    async fn produce(&self, request: Request<ProduceRequest>) -> Result<ProduceResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.produce(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn fetch(&self, request: Request<FetchRequest>) -> Result<Response<FetchResponse>, Status> {
-        todo!()
+    async fn fetch(&self, request: Request<FetchRequest>) -> Result<FetchResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.fetch(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn list_offsets(&self, request: Request<ListOffsetsRequest>) -> Result<Response<ListOffsetsResponse>, Status> {
-        todo!()
+    async fn list_offsets(&self, request: Request<ListOffsetsRequest>) -> Result<ListOffsetsResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.list_offsets(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn find_coordinator(&self, request: Request<GroupCoordinatorRequest>) -> Result<Response<GroupCoordinatorResponse>, Status> {
-        todo!()
+    async fn find_coordinator(&self, request: Request<GroupCoordinatorRequest>) -> Result<GroupCoordinatorResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.find_coordinator(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn join_group(&self, request: Request<JoinGroupRequest>) -> Result<Response<JoinGroupResponse>, Status> {
-        todo!()
+    async fn join_group(&self, request: Request<JoinGroupRequest>) -> Result<JoinGroupResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.join_group(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn sync_group(&self, request: Request<SyncGroupRequest>) -> Result<Response<SyncGroupResponse>, Status> {
-        todo!()
+    async fn sync_group(&self, request: Request<SyncGroupRequest>) -> Result<SyncGroupResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.sync_group(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn heartbeat(&self, request: Request<HeartbeatRequest>) -> Result<Response<HeartbeatResponse>, Status> {
-        todo!()
+    async fn heartbeat(&self, request: Request<HeartbeatRequest>) -> Result<HeartbeatResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.heartbeat(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn leave_group(&self, request: Request<LeaveGroupRequest>) -> Result<Response<LeaveGroupResponse>, Status> {
-        todo!()
+    async fn leave_group(&self, request: Request<LeaveGroupRequest>) -> Result<LeaveGroupResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.leave_group(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn commit_offset(&self, request: Request<OffsetCommitRequest>) -> Result<Response<OffsetCommitResponse>, Status> {
-        todo!()
+    async fn commit_offset(&self, request: Request<OffsetCommitRequest>) -> Result<OffsetCommitResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.commit_offset(request).await?;
+        Ok(response.into_inner())
     }
 
-    async fn fetch_offset(&self, request: Request<OffsetFetchRequest>) -> Result<Response<OffsetFetchResponse>, Status> {
-        todo!()
+    async fn fetch_offset(&self, request: Request<OffsetFetchRequest>) -> Result<OffsetFetchResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.fetch_offset(request).await?;
+        Ok(response.into_inner())
     }
 }
