@@ -1,7 +1,7 @@
 mod api;
 mod utils;
 mod client;
-mod broker_core;
+mod broker;
 
 fn main() {
     println!("Hello, world!");
