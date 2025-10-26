@@ -1,9 +1,9 @@
 syntax = "proto3";
 
-package api;
+package broker;
 
 // Kafka Broker Service
-service KafkaBroker {
+service Broker {
   // Topic Management
   rpc GetTopicMetadata(TopicMetadataRequest) returns (TopicMetadataResponse);
 

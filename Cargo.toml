@@ -9,5 +9,7 @@ tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-util = "0.7"
+async-trait = "0.1.89"
+
 [build-dependencies]
 tonic-build = "0.12"
