@@ -1,7 +1,11 @@
 [package]
 name = "Rust-MQ"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[lib]
+name = "rust_mq"
+path = "src/lib.rs"
 
 [dependencies]
 log = "0.4.27"
@@ -10,6 +14,12 @@ prost = "0.13"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-util = "0.7"
 async-trait = "0.1.89"
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1.0"
+thiserror = "1.0"
 
 [build-dependencies]
 tonic-build = "0.12"
