@@ -1,0 +1,32 @@
+# Full Configuration Example
+# This file shows all available configuration options
+
+broker:
+  # Broker address
+  address: "http://localhost:50051"
+  
+  # Connection timeout in seconds
+  timeout_secs: 30
+  
+  # Maximum retries for failed operations
+  max_retries: 3
+
+producer:
+  topic: "my-topic"
+  partition: 0
+  required_acks: 1
+  timeout_ms: 5000
+  batch_size: 100
+  flush_interval_ms: 100
+
+consumer:
+  topic: "my-topic"
+  partition: 0
+  group_id: "consumer-group-1"
+  offset: -2
+  max_bytes: 1048576
+  max_wait_ms: 1000
+  min_bytes: 1
+  auto_commit: true
+  auto_commit_interval_ms: 5000
+  poll_interval_ms: 1000
