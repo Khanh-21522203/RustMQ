@@ -4,18 +4,18 @@ A Kafka-like message queue system written in Rust with both CLI and library supp
 
 ## Features
 
-✅ **Multiple Modes**: Run as broker, producer, or consumer  
-✅ **Multi-Broker Support**: Distributed cluster with Raft consensus (NEW!)  
-✅ **High Availability**: Automatic leader election and failover  
-✅ **High Performance**: 800K+ msg/s throughput, <10ms latency  
-✅ **YAML Configuration**: Easy configuration management  
-✅ **Reusable Library**: Use as a library in your Rust projects  
-✅ **CLI Support**: Run as standalone tools  
-✅ **Graceful Shutdown**: Proper SIGINT/SIGTERM handling  
-✅ **Batch Processing**: Automatic message batching (2M+ msg/s with large batches)  
-✅ **Auto-commit**: Automatic offset management  
-✅ **Consumer Groups**: Offset tracking and load balancing  
-✅ **SOLID Architecture**: Clean, maintainable codebase
+- **Multiple Modes**: Run as broker, producer, or consumer  
+- **Multi-Broker Support**: Distributed cluster with Raft consensus 
+- **High Availability**: Automatic leader election and failover  
+- **High Performance**: 800K+ msg/s throughput, <10ms latency  
+- **YAML Configuration**: Easy configuration management  
+- **Reusable Library**: Use as a library in your Rust projects  
+- **CLI Support**: Run as standalone tools  
+- **Graceful Shutdown**: Proper SIGINT/SIGTERM handling  
+- **Batch Processing**: Automatic message batching (2M+ msg/s with large batches)  
+- **Auto-commit**: Automatic offset management  
+- **Consumer Groups**: Offset tracking and load balancing  
+- **SOLID Architecture**: Clean, maintainable codebase
 
 ## Architecture
 
