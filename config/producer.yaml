@@ -1,0 +1,28 @@
+# Producer Configuration Example
+
+broker:
+  address: "http://localhost:50051"
+  timeout_secs: 30
+  max_retries: 3
+
+producer:
+  # Topic to produce messages to
+  topic: "events"
+  
+  # Default partition (0-based)
+  partition: 0
+  
+  # Required acknowledgments:
+  # -1 = all replicas (most reliable)
+  #  0 = none (fire and forget)
+  #  1 = leader only (balanced)
+  required_acks: 1
+  
+  # Timeout for produce requests in milliseconds
+  timeout_ms: 5000
+  
+  # Batch size - number of messages to batch before sending
+  batch_size: 100
+  
+  # Flush interval - how often to flush batched messages (in milliseconds)
+  flush_interval_ms: 100

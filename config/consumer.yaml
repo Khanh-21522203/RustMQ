@@ -1,0 +1,41 @@
+# Consumer Configuration Example
+
+broker:
+  address: "http://localhost:50051"
+  timeout_secs: 30
+  max_retries: 3
+
+consumer:
+  # Topic to consume messages from
+  topic: "events"
+  
+  # Partition to consume from (0-based)
+  partition: 0
+  
+  # Consumer group ID for offset management
+  # Leave empty or null for no consumer group
+  group_id: "my-consumer-group"
+  
+  # Starting offset:
+  # -2 = earliest (start from beginning)
+  # -1 = latest (skip existing messages)
+  #  0+ = specific offset
+  offset: -2
+  
+  # Maximum bytes to fetch per request
+  max_bytes: 1048576  # 1MB
+  
+  # Maximum wait time for messages (in milliseconds)
+  max_wait_ms: 1000
+  
+  # Minimum bytes to wait for before returning
+  min_bytes: 1
+  
+  # Auto-commit offsets
+  auto_commit: true
+  
+  # Auto-commit interval (in milliseconds)
+  auto_commit_interval_ms: 5000
+  
+  # Poll interval - how often to check for new messages (in milliseconds)
+  poll_interval_ms: 1000

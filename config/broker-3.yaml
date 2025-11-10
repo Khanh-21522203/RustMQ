@@ -1,0 +1,32 @@
+# Broker 3 Configuration
+node_id: 3
+api_addr: "127.0.0.1:9094"
+rpc_addr: "127.0.0.1:19094"
+storage_path: "./data/broker-3"
+
+# Cluster configuration
+cluster:
+  # Initial cluster members (for joining existing cluster)
+  initial_members:
+    - node_id: 1
+      api_addr: "127.0.0.1:9092"
+      rpc_addr: "127.0.0.1:19092"
+    - node_id: 2
+      api_addr: "127.0.0.1:9093"
+      rpc_addr: "127.0.0.1:19093"
+    - node_id: 3
+      api_addr: "127.0.0.1:9094"
+      rpc_addr: "127.0.0.1:19094"
+  
+  # Bootstrap the cluster (false for nodes joining existing cluster)
+  bootstrap: false
+
+# Raft configuration
+raft:
+  heartbeat_interval_ms: 1000
+  election_timeout_min_ms: 3000
+  election_timeout_max_ms: 6000
+  snapshot_threshold: 10000
+
+# Logging
+log_level: "info"

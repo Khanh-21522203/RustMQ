@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package raft;
+
+// Generic Raft RPC message
+message RaftMessage {
+    string rpc_type = 1;
+    bytes data = 2;
+}
+
+// Generic Raft RPC reply
+message RaftReply {
+    bytes data = 1;
+    string error = 2;
+}
+
+// Raft service for inter-node communication
+service Raft {
+    rpc SendRaft(RaftMessage) returns (RaftReply);
+}
