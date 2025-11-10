@@ -297,13 +297,6 @@ Rust-MQ/
 ├── examples/                   # Usage examples
 └── docs/                       # Documentation
 ```
-
-## Documentation
-
-- **[USAGE_GUIDE.md](USAGE_GUIDE.md)** - Complete usage guide with examples
-- **[CLIENT_LIBRARY.md](CLIENT_LIBRARY.md)** - Library API reference
-- **[BROKER_IMPLEMENTATION.md](BROKER_IMPLEMENTATION.md)** - Broker architecture
-
 ## Testing
 
 ```bash
