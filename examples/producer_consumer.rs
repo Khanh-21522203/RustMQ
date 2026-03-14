@@ -24,7 +24,7 @@ struct CountingHandler {
 
 #[async_trait::async_trait]
 impl MessageHandler for CountingHandler {
-    async fn handle(&mut self, message: ConsumedMessage) -> Result<()> {
+    async fn handle(&self, message: ConsumedMessage) -> Result<()> {
         let count = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let value = message.value_as_string()?;
         
@@ -70,12 +70,11 @@ async fn main() -> Result<()> {
         flush_interval_ms: 100,
     };
     
-    let mut producer = Producer::new(
+    let producer = Producer::new(
         &format!("http://{}", broker_addr),
         producer_config,
     ).await?;
     
-    producer.start().await?;
     println!("✓ Producer started\n");
     
     // 3. Create and start consumer
@@ -183,8 +182,8 @@ async fn start_broker(addr: &str) -> Result<()> {
     let storage = InMemoryStorage::new(1, "localhost".to_string(), 50051);
     
     // Create broker core
-    let mut broker_core = BrokerCore::new(rpc_rx, storage);
-    
+    let broker_core = BrokerCore::new(rpc_rx, storage);
+
     // Start broker core in background
     tokio::spawn(async move {
         broker_core.run().await;

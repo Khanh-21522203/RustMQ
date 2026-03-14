@@ -24,7 +24,7 @@ struct BenchmarkHandler {
 
 #[async_trait::async_trait]
 impl MessageHandler for BenchmarkHandler {
-    async fn handle(&mut self, _message: ConsumedMessage) -> Result<()> {
+    async fn handle(&self, _message: ConsumedMessage) -> Result<()> {
         self.counter.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -33,8 +33,8 @@ impl MessageHandler for BenchmarkHandler {
 async fn start_broker(addr: &str) -> Result<()> {
     let (rpc_tx, rpc_rx) = mpsc::channel(10000);
     let storage = InMemoryStorage::new(1, "localhost".to_string(), 50051);
-    let mut broker_core = BrokerCore::new(rpc_rx, storage);
-    
+    let broker_core = BrokerCore::new(rpc_rx, storage);
+
     tokio::spawn(async move {
         broker_core.run().await;
     });
@@ -62,9 +62,7 @@ async fn benchmark_producer_throughput(message_count: usize, message_size: usize
         flush_interval_ms: 100,
     };
     
-    let mut producer = Producer::new("http://localhost:50051", config).await?;
-    producer.start().await?;
-    
+    let producer = Producer::new("http://localhost:50051", config).await?;
     let message = vec![0u8; message_size];
     let start = Instant::now();
     
@@ -105,9 +103,7 @@ async fn benchmark_e2e_latency(message_count: usize) -> Result<(Duration, Vec<Du
         poll_interval_ms: 10,
     };
     
-    let mut producer = Producer::new("http://localhost:50051", producer_config).await?;
-    producer.start().await?;
-    
+    let producer = Producer::new("http://localhost:50051", producer_config).await?;
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
     
@@ -154,9 +150,7 @@ async fn benchmark_consumer_throughput(message_count: usize) -> Result<(Duration
         flush_interval_ms: 100,
     };
     
-    let mut producer = Producer::new("http://localhost:50051", producer_config).await?;
-    producer.start().await?;
-    
+    let producer = Producer::new("http://localhost:50051", producer_config).await?;
     for i in 0..message_count {
         let msg = ProducerMessage::new(format!("Message {}", i).as_bytes().to_vec());
         producer.send(msg).await?;

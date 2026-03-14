@@ -38,7 +38,7 @@ struct PrintHandler;
 
 #[async_trait::async_trait]
 impl MessageHandler for PrintHandler {
-    async fn handle(&mut self, message: ConsumedMessage) -> Result<()> {
+    async fn handle(&self, message: ConsumedMessage) -> Result<()> {
         let value_str = message.value_as_string()
             .unwrap_or_else(|_| format!("<binary data: {} bytes>", message.value.len()));
         
@@ -111,7 +111,7 @@ async fn run_broker(args: Args) -> Result<()> {
         let (rpc_tx, rpc_rx) = mpsc::channel(1000);
         
         // Create broker core with multi-broker storage
-        let mut broker_core = BrokerCore::new(rpc_rx, multi_broker);
+        let broker_core = BrokerCore::new(rpc_rx, multi_broker);
         
         // Start broker core in background
         tokio::spawn(async move {
@@ -143,7 +143,7 @@ async fn run_broker(args: Args) -> Result<()> {
         let storage = InMemoryStorage::new(1, "localhost".to_string(), 50051);
         
         // Create broker core
-        let mut broker_core = BrokerCore::new(rpc_rx, storage);
+        let broker_core = BrokerCore::new(rpc_rx, storage);
         
         // Start broker core in background
         tokio::spawn(async move {
@@ -191,9 +191,8 @@ async fn run_producer(args: Args) -> Result<()> {
     log::info!("Starting producer for topic: {}", producer_config.topic);
     log::info!("Connecting to broker: {}", broker_addr);
     
-    let mut producer = Producer::new(broker_addr, producer_config).await?;
-    producer.start().await?;
-    
+    let producer = Producer::new(broker_addr, producer_config).await?;
+
     log::info!("Producer started. Waiting for input...");
     log::info!("Enter messages (one per line), Ctrl+C to exit:");
     

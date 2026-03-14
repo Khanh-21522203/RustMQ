@@ -17,25 +17,14 @@ pub struct ProducerMessage {
 }
 
 impl ProducerMessage {
-    /// Create a new message with value
     pub fn new(value: impl Into<Vec<u8>>) -> Self {
-        Self {
-            key: None,
-            value: value.into(),
-            partition: None,
-        }
+        Self { key: None, value: value.into(), partition: None }
     }
-    
-    /// Create a message with key and value
+
     pub fn with_key(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
-        Self {
-            key: Some(key.into()),
-            value: value.into(),
-            partition: None,
-        }
+        Self { key: Some(key.into()), value: value.into(), partition: None }
     }
-    
-    /// Set the target partition
+
     pub fn to_partition(mut self, partition: i32) -> Self {
         self.partition = Some(partition);
         self
@@ -55,98 +44,74 @@ pub struct Producer {
     config: ProducerConfig,
     client: Arc<KafkaBrokerClient>,
     batch: Arc<Mutex<Vec<ProducerMessage>>>,
-    shutdown_tx: Option<mpsc::Sender<()>>,
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 impl Producer {
-    /// Create a new producer
+    /// Create a new producer and start the background flush task.
     pub async fn new(broker_address: &str, config: ProducerConfig) -> Result<Self> {
-        let client = KafkaBrokerClient::new(broker_address)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to broker: {}", e))?;
-        
-        Ok(Self {
-            config,
-            client: Arc::new(client),
-            batch: Arc::new(Mutex::new(Vec::new())),
-            shutdown_tx: None,
-        })
-    }
-    
-    /// Start the producer with automatic flushing
-    pub async fn start(&mut self) -> Result<()> {
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-        self.shutdown_tx = Some(shutdown_tx);
-        
-        let batch = self.batch.clone();
-        let client = self.client.clone();
-        let config = self.config.clone();
-        
-        tokio::spawn(async move {
-            let mut flush_interval = interval(Duration::from_millis(config.flush_interval_ms));
-            
-            loop {
-                tokio::select! {
-                    _ = flush_interval.tick() => {
-                        let messages = {
-                            let mut batch_lock = batch.lock().await;
-                            if batch_lock.is_empty() {
-                                continue;
-                            }
-                            std::mem::take(&mut *batch_lock)
-                        };
-                        
-                        if let Err(e) = Self::send_batch(&client, &config, messages).await {
-                            log::error!("Failed to flush batch: {}", e);
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        log::info!("Producer shutdown signal received");
-                        
-                        // Final flush
-                        let messages = {
-                            let mut batch_lock = batch.lock().await;
-                            std::mem::take(&mut *batch_lock)
-                        };
-                        
-                        if !messages.is_empty() {
-                            if let Err(e) = Self::send_batch(&client, &config, messages).await {
-                                log::error!("Failed to flush final batch: {}", e);
+        let client = Arc::new(
+            KafkaBrokerClient::new(broker_address)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to broker: {}", e))?,
+        );
+        let batch = Arc::new(Mutex::new(Vec::new()));
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+        // Start background flush task immediately
+        {
+            let batch = batch.clone();
+            let client = client.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                let mut flush_interval = interval(Duration::from_millis(config.flush_interval_ms));
+                loop {
+                    tokio::select! {
+                        _ = flush_interval.tick() => {
+                            let messages = {
+                                let mut lock = batch.lock().await;
+                                if lock.is_empty() { continue; }
+                                std::mem::take(&mut *lock)
+                            };
+                            if let Err(e) = Self::send_batch_inner(&client, &config, messages).await {
+                                log::error!("Failed to flush batch: {}", e);
                             }
                         }
-                        
-                        break;
+                        _ = shutdown_rx.recv() => {
+                            log::info!("Producer flush task shutting down");
+                            // Final flush
+                            let messages = std::mem::take(&mut *batch.lock().await);
+                            if !messages.is_empty() {
+                                if let Err(e) = Self::send_batch_inner(&client, &config, messages).await {
+                                    log::error!("Failed to flush final batch: {}", e);
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
-            }
-            
-            log::info!("Producer background task stopped");
-        });
-        
-        log::info!("Producer started for topic: {}", self.config.topic);
-        Ok(())
+            });
+        }
+
+        log::info!("Producer started for topic: {}", config.topic);
+        Ok(Self { config, client, batch, shutdown_tx })
     }
-    
-    /// Send a single message (adds to batch)
+
+    /// Send a single message (adds to batch).
     pub async fn send(&self, message: ProducerMessage) -> Result<()> {
         let mut batch = self.batch.lock().await;
         batch.push(message);
-        
-        // Check if batch is full
         if batch.len() >= self.config.batch_size {
             let messages = std::mem::take(&mut *batch);
-            drop(batch); // Release lock before sending
-            
-            Self::send_batch(&self.client, &self.config, messages).await?;
+            drop(batch);
+            Self::send_batch_inner(&self.client, &self.config, messages).await?;
         }
-        
         Ok(())
     }
-    
-    /// Send a message and wait for result (synchronous mode)
+
+    /// Send a message synchronously (bypasses batch).
     pub async fn send_sync(&self, message: ProducerMessage) -> Result<ProducerResult> {
         let partition = message.partition.unwrap_or(self.config.partition);
-        
         let request = Request::new(ProduceRequest {
             required_acks: self.config.required_acks,
             timeout_ms: self.config.timeout_ms,
@@ -154,55 +119,41 @@ impl Producer {
                 topic_name: self.config.topic.clone(),
                 partitions: vec![produce_request::PartitionData {
                     partition,
-                    message_set: message.value,
+                    records: vec![Record {
+                        key: message.key,
+                        value: message.value,
+                    }],
                 }],
             }],
         });
-        
+
         let response = self.client.produce(request).await?;
-        
         for topic_result in response.results {
             for partition_result in topic_result.partitions {
                 if partition_result.error_code == 0 {
-                    log::debug!(
-                        "Message sent successfully: partition={}, offset={}",
-                        partition_result.partition,
-                        partition_result.offset
-                    );
-                    
                     return Ok(ProducerResult {
                         partition: partition_result.partition,
                         offset: partition_result.offset,
                         error_code: 0,
                     });
                 } else {
-                    anyhow::bail!(
-                        "Failed to send message: error_code={}",
-                        partition_result.error_code
-                    );
+                    anyhow::bail!("Failed to send message: error_code={}", partition_result.error_code);
                 }
             }
         }
-        
         anyhow::bail!("No response from broker")
     }
-    
-    /// Flush any pending messages
+
+    /// Flush any pending messages immediately.
     pub async fn flush(&self) -> Result<()> {
-        let messages = {
-            let mut batch = self.batch.lock().await;
-            std::mem::take(&mut *batch)
-        };
-        
+        let messages = std::mem::take(&mut *self.batch.lock().await);
         if !messages.is_empty() {
-            Self::send_batch(&self.client, &self.config, messages).await?;
+            Self::send_batch_inner(&self.client, &self.config, messages).await?;
         }
-        
         Ok(())
     }
-    
-    /// Send a batch of messages
-    async fn send_batch(
+
+    async fn send_batch_inner(
         client: &KafkaBrokerClient,
         config: &ProducerConfig,
         messages: Vec<ProducerMessage>,
@@ -210,31 +161,37 @@ impl Producer {
         if messages.is_empty() {
             return Ok(());
         }
-        
-        let partition_data: Vec<_> = messages
+
+        // Group messages by partition
+        let mut by_partition: std::collections::HashMap<i32, Vec<Record>> = std::collections::HashMap::new();
+        for msg in messages {
+            let partition = msg.partition.unwrap_or(config.partition);
+            by_partition.entry(partition).or_default().push(Record {
+                key: msg.key,
+                value: msg.value,
+            });
+        }
+
+        let partitions: Vec<produce_request::PartitionData> = by_partition
             .into_iter()
-            .map(|msg| produce_request::PartitionData {
-                partition: msg.partition.unwrap_or(config.partition),
-                message_set: msg.value,
-            })
+            .map(|(partition, records)| produce_request::PartitionData { partition, records })
             .collect();
-        
+
         let request = Request::new(ProduceRequest {
             required_acks: config.required_acks,
             timeout_ms: config.timeout_ms,
             topics: vec![produce_request::TopicData {
                 topic_name: config.topic.clone(),
-                partitions: partition_data,
+                partitions,
             }],
         });
-        
+
         let response = client.produce(request).await?;
-        
         for topic_result in response.results {
             for partition_result in topic_result.partitions {
                 if partition_result.error_code != 0 {
                     log::warn!(
-                        "Failed to send message to partition {}: error_code={}",
+                        "Failed to send to partition {}: error_code={}",
                         partition_result.partition,
                         partition_result.error_code
                     );
@@ -247,30 +204,16 @@ impl Producer {
                 }
             }
         }
-        
         Ok(())
     }
-    
-    /// Shutdown the producer gracefully
-    pub async fn shutdown(&mut self) -> Result<()> {
+
+    /// Shutdown the producer gracefully.
+    pub async fn shutdown(self) -> Result<()> {
         log::info!("Shutting down producer...");
-        
-        // Flush remaining messages
         self.flush().await?;
-        
-        // Signal background task to stop
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(()).await;
-        }
-        
+        let _ = self.shutdown_tx.send(()).await;
         log::info!("Producer shutdown complete");
         Ok(())
-    }
-}
-
-impl Drop for Producer {
-    fn drop(&mut self) {
-        log::debug!("Producer dropped");
     }
 }
 
@@ -283,11 +226,11 @@ mod tests {
         let msg = ProducerMessage::new(b"test");
         assert_eq!(msg.value, b"test");
         assert!(msg.key.is_none());
-        
+
         let msg_with_key = ProducerMessage::with_key(b"key", b"value");
         assert_eq!(msg_with_key.key.unwrap(), b"key");
         assert_eq!(msg_with_key.value, b"value");
-        
+
         let msg_with_partition = ProducerMessage::new(b"test").to_partition(1);
         assert_eq!(msg_with_partition.partition, Some(1));
     }

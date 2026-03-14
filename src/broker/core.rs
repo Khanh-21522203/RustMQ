@@ -1,101 +1,89 @@
-use tokio::sync::mpsc;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use crate::api::requests::BrokerGrpcRequest;
 use crate::api::responses::BrokerGrpcResponse;
 use crate::api::broker::*;
 use crate::broker::storage::BrokerStorage;
 
 pub struct BrokerCore<S: BrokerStorage> {
-    rpc_receive_channel: mpsc::Receiver<(BrokerGrpcRequest, mpsc::Sender<BrokerGrpcResponse>)>,
-    storage: Arc<Mutex<S>>,
+    rpc_receive_channel: mpsc::Receiver<(BrokerGrpcRequest, oneshot::Sender<BrokerGrpcResponse>)>,
+    storage: S,
 }
 
 impl<S: BrokerStorage + 'static> BrokerCore<S> {
     pub fn new(
-        rpc_receive_channel: mpsc::Receiver<(BrokerGrpcRequest, mpsc::Sender<BrokerGrpcResponse>)>,
+        rpc_receive_channel: mpsc::Receiver<(BrokerGrpcRequest, oneshot::Sender<BrokerGrpcResponse>)>,
         storage: S,
     ) -> Self {
-        Self {
-            rpc_receive_channel,
-            storage: Arc::new(Mutex::new(storage)),
-        }
+        Self { rpc_receive_channel, storage }
     }
-    
-    pub async fn run(&mut self) {
+
+    pub async fn run(mut self) {
         loop {
-            let event = self.rpc_receive_channel.recv().await;
-            self.handle_rpc_event(event).await;
+            match self.rpc_receive_channel.recv().await {
+                Some((request, response_sender)) => {
+                    self.handle_rpc(request, response_sender).await;
+                }
+                None => {
+                    log::info!("RPC channel closed; broker core shutting down");
+                    break;
+                }
+            }
         }
     }
 
-    async fn handle_rpc_event(&mut self, rpc_event: Option<(BrokerGrpcRequest, mpsc::Sender<BrokerGrpcResponse>)>) {
-        match rpc_event {
-            Some((request, response_sender)) => {
-                let result = match request {
-                    BrokerGrpcRequest::GetTopicMetadata(request) => {
-                        let response = self.handle_get_topic_metadata(request).await; 
-                        response_sender.send(BrokerGrpcResponse::GetTopicMetadata(response)).await
-                    },
-                    BrokerGrpcRequest::Produce(request) => {
-                        let response = self.handle_produce(request).await;
-                        response_sender.send(BrokerGrpcResponse::Produce(response)).await
-                    },
-                    BrokerGrpcRequest::Fetch(request) => {
-                        let response = self.handle_fetch(request).await;
-                        response_sender.send(BrokerGrpcResponse::Fetch(response)).await
-                    },
-                    BrokerGrpcRequest::ListOffsets(request) => {
-                        let response = self.handle_list_offsets(request).await;
-                        response_sender.send(BrokerGrpcResponse::ListOffsets(response)).await
-                    },
-                    BrokerGrpcRequest::FindCoordinator(request) => {
-                        let response = self.handle_find_coordinator(request).await;
-                        response_sender.send(BrokerGrpcResponse::FindCoordinator(response)).await
-                    },
-                    BrokerGrpcRequest::JoinGroup(request) => {
-                        let response = self.handle_join_group(request).await;
-                        response_sender.send(BrokerGrpcResponse::JoinGroup(response)).await
-                    },
-                    BrokerGrpcRequest::SyncGroup(request) => {
-                        let response = self.handle_sync_group(request).await;
-                        response_sender.send(BrokerGrpcResponse::SyncGroup(response)).await
-                    },
-                    BrokerGrpcRequest::Heartbeat(request) => {
-                        let response = self.handle_heartbeat(request).await;
-                        response_sender.send(BrokerGrpcResponse::Heartbeat(response)).await
-                    },
-                    BrokerGrpcRequest::LeaveGroup(request) => {
-                        let response = self.handle_leave_group(request).await;
-                        response_sender.send(BrokerGrpcResponse::LeaveGroup(response)).await
-                    },
-                    BrokerGrpcRequest::CommitOffset(request) => {
-                        let response = self.handle_commit_offset(request).await;
-                        response_sender.send(BrokerGrpcResponse::CommitOffset(response)).await
-                    }, 
-                    BrokerGrpcRequest::FetchOffset(request) => {
-                        let response = self.handle_fetch_offset(request).await;
-                        response_sender.send(BrokerGrpcResponse::FetchOffset(response)).await
-                    },
-                };
+    async fn handle_rpc(
+        &mut self,
+        request: BrokerGrpcRequest,
+        response_sender: oneshot::Sender<BrokerGrpcResponse>,
+    ) {
+        let response = match request {
+            BrokerGrpcRequest::GetTopicMetadata(req) => {
+                BrokerGrpcResponse::GetTopicMetadata(self.handle_get_topic_metadata(req).await)
             }
-            None => {
-                log::error!("Failed to receive RPC event");
+            BrokerGrpcRequest::Produce(req) => {
+                BrokerGrpcResponse::Produce(self.handle_produce(req).await)
             }
-        }
+            BrokerGrpcRequest::Fetch(req) => {
+                BrokerGrpcResponse::Fetch(self.handle_fetch(req).await)
+            }
+            BrokerGrpcRequest::ListOffsets(req) => {
+                BrokerGrpcResponse::ListOffsets(self.handle_list_offsets(req).await)
+            }
+            BrokerGrpcRequest::FindCoordinator(req) => {
+                BrokerGrpcResponse::FindCoordinator(self.handle_find_coordinator(req).await)
+            }
+            BrokerGrpcRequest::JoinGroup(req) => {
+                BrokerGrpcResponse::JoinGroup(self.handle_join_group(req).await)
+            }
+            BrokerGrpcRequest::SyncGroup(req) => {
+                BrokerGrpcResponse::SyncGroup(self.handle_sync_group(req).await)
+            }
+            BrokerGrpcRequest::Heartbeat(req) => {
+                BrokerGrpcResponse::Heartbeat(self.handle_heartbeat(req).await)
+            }
+            BrokerGrpcRequest::LeaveGroup(req) => {
+                BrokerGrpcResponse::LeaveGroup(self.handle_leave_group(req).await)
+            }
+            BrokerGrpcRequest::CommitOffset(req) => {
+                BrokerGrpcResponse::CommitOffset(self.handle_commit_offset(req).await)
+            }
+            BrokerGrpcRequest::FetchOffset(req) => {
+                BrokerGrpcResponse::FetchOffset(self.handle_fetch_offset(req).await)
+            }
+        };
+        let _ = response_sender.send(response);
     }
-    async fn handle_get_topic_metadata(&mut self, request: TopicMetadataRequest) -> TopicMetadataResponse {
-        let storage = self.storage.lock().await;
-        
+
+    async fn handle_get_topic_metadata(&self, request: TopicMetadataRequest) -> TopicMetadataResponse {
         let topics = if request.topics.is_empty() {
-            storage.get_topics().await
+            self.storage.get_topics().await
         } else {
             request.topics
         };
 
         let mut topic_metadata = Vec::new();
         for topic_name in topics {
-            if let Some(partitions) = storage.get_topic_partitions(&topic_name).await {
+            if let Some(partitions) = self.storage.get_topic_partitions(&topic_name).await {
                 let partition_metadata: Vec<topic_metadata_response::PartitionMetadata> = partitions
                     .iter()
                     .map(|&partition_id| topic_metadata_response::PartitionMetadata {
@@ -106,7 +94,6 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                         isr: vec![1],
                     })
                     .collect();
-
                 topic_metadata.push(topic_metadata_response::TopicMetadata {
                     topic_error_code: 0,
                     topic_name,
@@ -115,79 +102,75 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
             }
         }
 
-        let (broker_id, host, port) = storage.get_coordinator_info().await;
+        let (broker_id, host, port) = self.storage.get_coordinator_info().await;
         TopicMetadataResponse {
-            brokers: vec![topic_metadata_response::Broker {
-                node_id: broker_id,
-                host,
-                port,
-            }],
+            brokers: vec![topic_metadata_response::Broker { node_id: broker_id, host, port }],
             topics: topic_metadata,
         }
     }
 
-    async fn handle_produce(&mut self, request: ProduceRequest) -> ProduceResponse {
-        let mut storage = self.storage.lock().await;
+    async fn handle_produce(&self, request: ProduceRequest) -> ProduceResponse {
         let mut results = Vec::new();
-
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
-            
             for partition_data in topic_data.partitions {
-                match storage.produce_message(
-                    &topic_data.topic_name,
-                    partition_data.partition,
-                    partition_data.message_set,
-                ).await {
-                    Ok(offset) => {
-                        partition_results.push(produce_response::PartitionResult {
-                            partition: partition_data.partition,
-                            error_code: 0,
-                            offset,
-                        });
-                    }
-                    Err(e) => {
-                        log::error!("Failed to produce message: {}", e);
-                        partition_results.push(produce_response::PartitionResult {
-                            partition: partition_data.partition,
-                            error_code: 1,
-                            offset: -1,
-                        });
+                // Produce each record in the partition batch
+                let mut last_offset = -1i64;
+                let mut error_code = 0i32;
+                for record in partition_data.records {
+                    match self.storage.produce_message(
+                        &topic_data.topic_name,
+                        partition_data.partition,
+                        record.key,
+                        record.value,
+                    ).await {
+                        Ok(offset) => { last_offset = offset; }
+                        Err(e) => {
+                            log::error!("Failed to produce message: {}", e);
+                            error_code = 1;
+                        }
                     }
                 }
+                partition_results.push(produce_response::PartitionResult {
+                    partition: partition_data.partition,
+                    error_code,
+                    offset: last_offset,
+                });
             }
-
             results.push(produce_response::TopicResult {
                 topic_name: topic_data.topic_name,
                 partitions: partition_results,
             });
         }
-
         ProduceResponse { results }
     }
 
-    async fn handle_fetch(&mut self, request: FetchRequest) -> FetchResponse {
-        let storage = self.storage.lock().await;
+    async fn handle_fetch(&self, request: FetchRequest) -> FetchResponse {
         let mut topics = Vec::new();
-
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
-
             for partition_data in topic_data.partitions {
-                match storage.fetch_messages(
+                match self.storage.fetch_messages(
                     &topic_data.topic_name,
                     partition_data.partition,
                     partition_data.fetch_offset,
                     partition_data.max_bytes,
                 ).await {
-                    Ok((message_set, high_watermark)) => {
-                        let message_set_size = message_set.len() as i32;
+                    Ok(messages) => {
+                        let high_watermark = messages.last().map_or(partition_data.fetch_offset, |m| m.offset + 1);
+                        let records: Vec<FetchedRecord> = messages
+                            .into_iter()
+                            .map(|m| FetchedRecord {
+                                offset: m.offset,
+                                key: m.key,
+                                value: m.value,
+                            })
+                            .collect();
                         partition_results.push(fetch_response::PartitionResult {
                             partition: partition_data.partition,
                             error_code: 0,
                             high_watermark_offset: high_watermark,
-                            message_set_size,
-                            message_set,
+                            records,
                         });
                     }
                     Err(e) => {
@@ -196,31 +179,25 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                             partition: partition_data.partition,
                             error_code: 1,
                             high_watermark_offset: 0,
-                            message_set_size: 0,
-                            message_set: Vec::new(),
+                            records: vec![],
                         });
                     }
                 }
             }
-
             topics.push(fetch_response::TopicResult {
                 topic_name: topic_data.topic_name,
                 partitions: partition_results,
             });
         }
-
         FetchResponse { topics }
     }
 
-    async fn handle_list_offsets(&mut self, request: ListOffsetsRequest) -> ListOffsetsResponse {
-        let storage = self.storage.lock().await;
+    async fn handle_list_offsets(&self, request: ListOffsetsRequest) -> ListOffsetsResponse {
         let mut topics = Vec::new();
-
         for topic_data in request.topics {
             let mut partition_offsets = Vec::new();
-
             for partition_data in topic_data.partitions {
-                match storage.get_partition_offset(
+                match self.storage.get_partition_offset(
                     &topic_data.topic_name,
                     partition_data.partition,
                     partition_data.time,
@@ -242,21 +219,17 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                     }
                 }
             }
-
             topics.push(list_offsets_response::TopicResult {
                 topic_name: topic_data.topic_name,
                 partitions: partition_offsets,
             });
         }
-
         ListOffsetsResponse { topics }
     }
 
-    async fn handle_find_coordinator(&mut self, request: GroupCoordinatorRequest) -> GroupCoordinatorResponse {
-        let storage = self.storage.lock().await;
-        let (coordinator_id, coordinator_host, coordinator_port) = 
-            storage.get_coordinator_info().await;
-
+    async fn handle_find_coordinator(&self, _request: GroupCoordinatorRequest) -> GroupCoordinatorResponse {
+        let (coordinator_id, coordinator_host, coordinator_port) =
+            self.storage.get_coordinator_info().await;
         GroupCoordinatorResponse {
             error_code: 0,
             coordinator_id,
@@ -265,19 +238,12 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_join_group(&mut self, request: JoinGroupRequest) -> JoinGroupResponse {
-        let mut storage = self.storage.lock().await;
-        
-        match storage.join_group(
-            &request.group_id,
-            &request.member_id,
-            &request.protocol_type,
-        ).await {
+    async fn handle_join_group(&self, request: JoinGroupRequest) -> JoinGroupResponse {
+        match self.storage.join_group(&request.group_id, &request.member_id, &request.protocol_type).await {
             Ok((generation_id, leader_id, member_id, members)) => {
                 let protocol = request.group_protocols.first()
                     .map(|p| p.protocol_name.clone())
                     .unwrap_or_default();
-
                 let member_list: Vec<join_group_response::Member> = members
                     .iter()
                     .map(|m| join_group_response::Member {
@@ -285,7 +251,6 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                         member_metadata: m.metadata.clone(),
                     })
                     .collect();
-
                 JoinGroupResponse {
                     error_code: 0,
                     generation_id,
@@ -309,38 +274,18 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_sync_group(&mut self, request: SyncGroupRequest) -> SyncGroupResponse {
-        let mut storage = self.storage.lock().await;
-        
-        match storage.sync_group(
-            &request.group_id,
-            request.generation_id,
-            &request.member_id,
-        ).await {
-            Ok(member_assignment) => {
-                SyncGroupResponse {
-                    error_code: 0,
-                    member_assignment,
-                }
-            }
+    async fn handle_sync_group(&self, request: SyncGroupRequest) -> SyncGroupResponse {
+        match self.storage.sync_group(&request.group_id, request.generation_id, &request.member_id).await {
+            Ok(member_assignment) => SyncGroupResponse { error_code: 0, member_assignment },
             Err(e) => {
                 log::error!("Failed to sync group: {}", e);
-                SyncGroupResponse {
-                    error_code: 1,
-                    member_assignment: Vec::new(),
-                }
+                SyncGroupResponse { error_code: 1, member_assignment: Vec::new() }
             }
         }
     }
 
-    async fn handle_heartbeat(&mut self, request: HeartbeatRequest) -> HeartbeatResponse {
-        let mut storage = self.storage.lock().await;
-        
-        match storage.heartbeat(
-            &request.group_id,
-            request.generation_id,
-            &request.member_id,
-        ).await {
+    async fn handle_heartbeat(&self, request: HeartbeatRequest) -> HeartbeatResponse {
+        match self.storage.heartbeat(&request.group_id, request.generation_id, &request.member_id).await {
             Ok(_) => HeartbeatResponse { error_code: 0 },
             Err(e) => {
                 log::error!("Heartbeat failed: {}", e);
@@ -349,10 +294,8 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_leave_group(&mut self, request: LeaveGroupRequest) -> LeaveGroupResponse {
-        let mut storage = self.storage.lock().await;
-        
-        match storage.leave_group(&request.group_id, &request.member_id).await {
+    async fn handle_leave_group(&self, request: LeaveGroupRequest) -> LeaveGroupResponse {
+        match self.storage.leave_group(&request.group_id, &request.member_id).await {
             Ok(_) => LeaveGroupResponse { error_code: 0 },
             Err(e) => {
                 log::error!("Failed to leave group: {}", e);
@@ -361,15 +304,12 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_commit_offset(&mut self, request: OffsetCommitRequest) -> OffsetCommitResponse {
-        let mut storage = self.storage.lock().await;
+    async fn handle_commit_offset(&self, request: OffsetCommitRequest) -> OffsetCommitResponse {
         let mut topics = Vec::new();
-
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
-
             for partition_data in topic_data.partitions {
-                match storage.commit_offset(
+                match self.storage.commit_offset(
                     &request.consumer_group_id,
                     &topic_data.topic_name,
                     partition_data.partition,
@@ -391,26 +331,21 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                     }
                 }
             }
-
             topics.push(offset_commit_response::TopicResult {
                 topic_name: topic_data.topic_name,
                 partitions: partition_results,
             });
         }
-
         OffsetCommitResponse { topics }
     }
 
-    async fn handle_fetch_offset(&mut self, request: OffsetFetchRequest) -> OffsetFetchResponse {
-        let storage = self.storage.lock().await;
+    async fn handle_fetch_offset(&self, request: OffsetFetchRequest) -> OffsetFetchResponse {
         let mut topics = Vec::new();
-
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
-
             for partition in topic_data.partitions {
-                match storage.fetch_offset(
-                    &request.consumer_group,
+                match self.storage.fetch_offset(
+                    &request.consumer_group_id,
                     &topic_data.topic_name,
                     partition,
                 ).await {
@@ -433,14 +368,11 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                     }
                 }
             }
-
             topics.push(offset_fetch_response::TopicResult {
                 topic_name: topic_data.topic_name,
                 partitions: partition_results,
             });
         }
-
         OffsetFetchResponse { topics }
     }
-    
 }

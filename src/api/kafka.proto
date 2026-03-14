@@ -26,6 +26,21 @@ service Broker {
   rpc FetchOffset(OffsetFetchRequest) returns (OffsetFetchResponse);
 }
 
+// ==================== RECORDS ====================
+
+/// A single message in a produce request.
+message Record {
+  optional bytes key = 1;
+  bytes value = 2;
+}
+
+/// A single message returned in a fetch response.
+message FetchedRecord {
+  int64 offset = 1;
+  optional bytes key = 2;
+  bytes value = 3;
+}
+
 // ==================== TOPIC METADATA ====================
 
 message TopicMetadataRequest {
@@ -71,7 +86,7 @@ message ProduceRequest {
 
   message PartitionData {
     int32 partition = 1;
-    bytes message_set = 2;  // Serialized message set
+    repeated Record records = 2;
   }
 }
 
@@ -86,16 +101,16 @@ message ProduceResponse {
   message PartitionResult {
     int32 partition = 1;
     int32 error_code = 2;
-    int64 offset = 3;  // Offset của message đã được ghi
+    int64 offset = 3;
   }
 }
 
 // ==================== FETCH ====================
 
 message FetchRequest {
-  int32 replica_id = 1;  // -1 cho consumer
+  int32 replica_id = 1;  // -1 for consumer
   int32 max_wait_time = 2;  // Max time to wait (ms)
-  int32 min_bytes = 3;  // Min bytes để response
+  int32 min_bytes = 3;  // Min bytes to respond
   repeated TopicData topics = 4;
 
   message TopicData {
@@ -122,8 +137,7 @@ message FetchResponse {
     int32 partition = 1;
     int32 error_code = 2;
     int64 high_watermark_offset = 3;
-    int32 message_set_size = 4;
-    bytes message_set = 5;
+    repeated FetchedRecord records = 4;
   }
 }
 
@@ -230,7 +244,7 @@ message HeartbeatRequest {
 }
 
 message HeartbeatResponse {
-  int32 error_code = 1;  // 0=NoError, non-zero to signal rejoin
+  int32 error_code = 1;
 }
 
 // ==================== LEAVE GROUP ====================
@@ -279,7 +293,7 @@ message OffsetCommitResponse {
 // ==================== OFFSET FETCH ====================
 
 message OffsetFetchRequest {
-  string consumer_group = 1;
+  string consumer_group_id = 1;
   repeated TopicData topics = 2;
 
   message TopicData {
@@ -306,21 +320,20 @@ message OffsetFetchResponse {
 
 // ==================== ERROR CODES ====================
 
-// Common Kafka Error Codes
-// 0   = NoError
-// -1  = Unknown
-// 1   = OffsetOutOfRange
-// 2   = InvalidMessage
-// 3   = UnknownTopicOrPartition
-// 5   = LeaderNotAvailable
-// 6   = NotLeaderForPartition
-// 14  = OffsetMetadataTooLarge
-// 15  = GroupLoadInProgress
-// 16  = GroupCoordinatorNotAvailable
-// 17  = NotCoordinatorForGroup
-// 22  = InvalidGroupId
-// 24  = UnknownMemberId
-// 25  = InvalidSessionTimeout
-// 27  = RebalanceInProgress
-
-// Reference: https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol
+enum ErrorCode {
+  NO_ERROR = 0;
+  UNKNOWN = 1;
+  OFFSET_OUT_OF_RANGE = 2;
+  INVALID_MESSAGE = 3;
+  UNKNOWN_TOPIC_OR_PARTITION = 4;
+  LEADER_NOT_AVAILABLE = 5;
+  NOT_LEADER_FOR_PARTITION = 6;
+  OFFSET_METADATA_TOO_LARGE = 7;
+  GROUP_LOAD_IN_PROGRESS = 8;
+  GROUP_COORDINATOR_NOT_AVAILABLE = 9;
+  NOT_COORDINATOR_FOR_GROUP = 10;
+  INVALID_GROUP_ID = 11;
+  UNKNOWN_MEMBER_ID = 12;
+  INVALID_SESSION_TIMEOUT = 13;
+  REBALANCE_IN_PROGRESS = 14;
+}
