@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, Duration};
 use tonic::Request;
@@ -70,6 +71,9 @@ pub struct Consumer {
     /// Active partitions (from config or group assignment)
     active_partitions: Vec<i32>,
     shutdown_tx: Option<mpsc::Sender<()>>,
+    heartbeat_shutdown_tx: Option<mpsc::Sender<()>>,
+    needs_rejoin: Arc<AtomicBool>,
+    member_id: Option<String>,
     is_running: bool,
 }
 
@@ -86,6 +90,9 @@ impl Consumer {
             offsets_initialized: false,
             active_partitions,
             shutdown_tx: None,
+            heartbeat_shutdown_tx: None,
+            needs_rejoin: Arc::new(AtomicBool::new(false)),
+            member_id: None,
             is_running: false,
         })
     }
@@ -98,7 +105,9 @@ impl Consumer {
 
         // Join group and get partition assignment if consumer group is configured
         if let Some(group_id) = &self.config.group_id.clone() {
-            let assigned = Self::join_and_sync(&self.client, &self.config, group_id).await?;
+            let (assigned, member_id) =
+                Self::join_and_sync(&self.client, &self.config, group_id, None).await?;
+            self.member_id = Some(member_id);
             if !assigned.is_empty() {
                 self.active_partitions = assigned;
                 log::info!("Group assignment: partitions {:?}", self.active_partitions);
@@ -118,9 +127,50 @@ impl Consumer {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
 
+        // Spawn heartbeat task if in a consumer group
+        if let (Some(group_id), Some(member_id)) =
+            (self.config.group_id.clone(), self.member_id.clone())
+        {
+            let (hb_shutdown_tx, mut hb_shutdown_rx) = mpsc::channel::<()>(1);
+            self.heartbeat_shutdown_tx = Some(hb_shutdown_tx);
+            let hb_client = self.client.clone();
+            let hb_needs_rejoin = self.needs_rejoin.clone();
+            tokio::spawn(async move {
+                let mut hb_interval = interval(Duration::from_secs(10));
+                loop {
+                    tokio::select! {
+                        _ = hb_interval.tick() => {
+                            let req = Request::new(HeartbeatRequest {
+                                group_id: group_id.clone(),
+                                generation_id: 0, // broker ignores this field
+                                member_id: member_id.clone(),
+                            });
+                            match hb_client.heartbeat(req).await {
+                                Ok(resp) if resp.error_code == 27 => {
+                                    log::info!("Heartbeat: REBALANCE_IN_PROGRESS, will rejoin");
+                                    hb_needs_rejoin.store(true, Ordering::SeqCst);
+                                }
+                                Ok(resp) if resp.error_code != 0 => {
+                                    log::warn!("Heartbeat error_code={}", resp.error_code);
+                                }
+                                Err(e) => log::warn!("Heartbeat failed: {}", e),
+                                _ => {}
+                            }
+                        }
+                        _ = hb_shutdown_rx.recv() => {
+                            log::info!("Heartbeat task shutting down");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         let client = self.client.clone();
         let config = self.config.clone();
-        let active_partitions = self.active_partitions.clone();
+        let initial_partitions = self.active_partitions.clone();
+        let initial_member_id = self.member_id.clone();
+        let needs_rejoin = self.needs_rejoin.clone();
         let mut partition_offsets = offsets;
 
         tokio::spawn(async move {
@@ -130,23 +180,48 @@ impl Consumer {
             } else {
                 None
             };
+            let mut active_partitions = initial_partitions;
+            let mut member_id = initial_member_id;
 
             loop {
                 tokio::select! {
                     _ = poll_interval.tick() => {
-                        match Self::fetch_all_partitions(&client, &config, &active_partitions, &partition_offsets).await {
-                            Ok(messages) => {
-                                for message in messages {
-                                    // Advance the per-partition offset
-                                    partition_offsets.insert(message.partition, message.offset + 1);
-                                    if let Err(e) = handler.handle(message).await {
-                                        log::error!("Error handling message: {}", e);
+                        // Rejoin if a rebalance was detected by the heartbeat task
+                        if needs_rejoin.load(Ordering::SeqCst) {
+                            if let Some(group_id) = &config.group_id {
+                                match Self::join_and_sync(&client, &config, group_id, member_id.as_deref()).await {
+                                    Ok((new_partitions, new_member_id)) => {
+                                        member_id = Some(new_member_id);
+                                        // Fill in offsets for newly assigned partitions only
+                                        for &p in &new_partitions {
+                                            if !partition_offsets.contains_key(&p) {
+                                                if let Ok(o) = Self::resolve_partition_offset(&client, &config, p).await {
+                                                    partition_offsets.insert(p, o);
+                                                }
+                                            }
+                                        }
+                                        partition_offsets.retain(|p, _| new_partitions.contains(p));
+                                        active_partitions = new_partitions;
+                                        log::info!("Rejoined group, new partitions: {:?}", active_partitions);
+                                    }
+                                    Err(e) => log::error!("Rejoin failed, will retry: {}", e),
+                                }
+                                needs_rejoin.store(false, Ordering::SeqCst);
+                            }
+                        } else {
+                            match Self::fetch_all_partitions(&client, &config, &active_partitions, &partition_offsets).await {
+                                Ok(messages) => {
+                                    for message in messages {
+                                        partition_offsets.insert(message.partition, message.offset + 1);
+                                        if let Err(e) = handler.handle(message).await {
+                                            log::error!("Error handling message: {}", e);
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                log::error!("Failed to fetch messages: {}", e);
-                                sleep(Duration::from_secs(1)).await;
+                                Err(e) => {
+                                    log::error!("Failed to fetch messages: {}", e);
+                                    sleep(Duration::from_secs(1)).await;
+                                }
                             }
                         }
                     }
@@ -230,14 +305,16 @@ impl Consumer {
     }
 
     /// Join a consumer group and sync to get partition assignments.
-    /// Returns the list of assigned partitions (empty if group has no partitions assigned).
+    /// Returns (assigned_partitions, actual_member_id).
     async fn join_and_sync(
         client: &KafkaBrokerClient,
         config: &ConsumerConfig,
         group_id: &str,
-    ) -> Result<Vec<i32>> {
-        // Generate a unique member ID
-        let member_id = format!("consumer-{}", uuid_simple());
+        existing_member_id: Option<&str>,
+    ) -> Result<(Vec<i32>, String)> {
+        let member_id = existing_member_id
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("consumer-{}", uuid_simple()));
 
         // JoinGroup: send topic name as protocol_metadata
         let join_req = Request::new(JoinGroupRequest {
@@ -265,7 +342,7 @@ impl Consumer {
         let sync_req = Request::new(SyncGroupRequest {
             group_id: group_id.to_string(),
             generation_id,
-            member_id: actual_member_id,
+            member_id: actual_member_id.clone(),
             group_assignment: vec![],
         });
 
@@ -277,13 +354,12 @@ impl Consumer {
         }
 
         // Decode assigned partitions from bincode
-        if sync_resp.member_assignment.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let partitions: Vec<i32> = bincode::deserialize(&sync_resp.member_assignment)
-            .unwrap_or_default();
-        Ok(partitions)
+        let partitions: Vec<i32> = if sync_resp.member_assignment.is_empty() {
+            vec![]
+        } else {
+            bincode::deserialize(&sync_resp.member_assignment).unwrap_or_default()
+        };
+        Ok((partitions, actual_member_id))
     }
 
     async fn resolve_starting_offsets(
@@ -439,6 +515,9 @@ impl Consumer {
             return Ok(());
         }
         log::info!("Shutting down consumer...");
+        if let Some(tx) = self.heartbeat_shutdown_tx.take() {
+            let _ = tx.send(()).await;
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
         }
@@ -452,7 +531,8 @@ impl Consumer {
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    format!("{}-{}", t.as_secs(), t.subsec_nanos())
+    let pid = std::process::id();
+    format!("{}-{}-{}", t.as_secs(), t.subsec_nanos(), pid)
 }
 
 impl Drop for Consumer {

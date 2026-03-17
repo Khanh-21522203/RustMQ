@@ -218,6 +218,7 @@ impl Producer {
         });
 
         let response = client.produce(request).await?;
+        let mut failed_partitions = Vec::new();
         for topic_result in response.results {
             for partition_result in topic_result.partitions {
                 if partition_result.error_code != 0 {
@@ -226,6 +227,7 @@ impl Producer {
                         partition_result.partition,
                         partition_result.error_code
                     );
+                    failed_partitions.push(partition_result.partition);
                 } else {
                     log::debug!(
                         "Batch sent: partition={}, offset={}",
@@ -234,6 +236,9 @@ impl Producer {
                     );
                 }
             }
+        }
+        if !failed_partitions.is_empty() {
+            anyhow::bail!("Produce failed for partitions: {:?}", failed_partitions);
         }
         Ok(())
     }

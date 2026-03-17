@@ -240,10 +240,16 @@ impl RaftNode {
                 store.set_hardstate(hs.clone());
             }
             if !ready.entries().is_empty() {
-                store.append(ready.entries()).unwrap();
+                if let Err(e) = store.append(ready.entries()) {
+                    log::error!("Failed to append raft entries: {:?}", e);
+                    return;
+                }
             }
             if !ready.snapshot().is_empty() {
-                store.apply_snapshot(ready.snapshot().clone()).unwrap();
+                if let Err(e) = store.apply_snapshot(ready.snapshot().clone()) {
+                    log::error!("Failed to apply raft snapshot: {:?}", e);
+                    return;
+                }
             }
         }
 

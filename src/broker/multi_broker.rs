@@ -193,8 +193,16 @@ impl BrokerStorage for MultiBroker {
 
     async fn get_partition_offset(&self, topic: &str, partition: i32, time: i64) -> Result<Vec<i64>, String> {
         let data = self.raft_storage.read_data().await;
-        let len = data.messages.get(&(topic.to_owned(), partition)).map_or(0, |log| log.len() as i64);
-        Ok(match time { -1 | _ => vec![len], })
+        let log = data.messages.get(&(topic.to_owned(), partition));
+        let offset = match time {
+            -1 => vec![log.map_or(0, |l| l.len() as i64)],
+            -2 => vec![log.and_then(|l| l.first()).map_or(0, |m| m.offset)],
+            ts => {
+                let idx = log.map_or(0, |l| l.partition_point(|m| m.timestamp_ms < ts));
+                vec![log.and_then(|l| l.get(idx)).map_or(log.map_or(0, |l| l.len() as i64), |m| m.offset)]
+            }
+        };
+        Ok(offset)
     }
 
     async fn commit_offset(&self, group: &str, topic: &str, partition: i32, offset: i64, _metadata: String) -> Result<(), String> {

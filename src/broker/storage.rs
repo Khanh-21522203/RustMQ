@@ -205,7 +205,7 @@ impl InMemoryStorage {
             let mut store = inner.write().await;
             let group_ids: Vec<String> = store.groups.keys().cloned().collect();
             for group_id in group_ids {
-                let group = store.groups.get_mut(&group_id).unwrap();
+                let Some(group) = store.groups.get_mut(&group_id) else { continue; };
 
                 // Expire timed-out members
                 let session_timeout = group.session_timeout_ms;
@@ -233,7 +233,7 @@ impl InMemoryStorage {
                     && now - group.rebalance_started_ms > REBALANCE_TIMEOUT_MS
                 {
                     let topics = store.topics.clone();
-                    let group = store.groups.get_mut(&group_id).unwrap();
+                    let Some(group) = store.groups.get_mut(&group_id) else { continue; };
                     in_memory_finalize_rebalance(group, &topics);
                 }
             }
@@ -366,7 +366,11 @@ impl BrokerStorage for InMemoryStorage {
                 let offset = match time {
                     -1 => vec![partition_data.len() as i64],
                     -2 => vec![partition_data.first().map_or(0, |m| m.offset)],
-                    _ => vec![partition_data.len() as i64],
+                    ts => {
+                        // Binary search for first message at or after timestamp
+                        let idx = partition_data.partition_point(|m| m.timestamp_ms < ts);
+                        vec![partition_data.get(idx).map_or(partition_data.len() as i64, |m| m.offset)]
+                    }
                 };
                 return Ok(offset);
             }
