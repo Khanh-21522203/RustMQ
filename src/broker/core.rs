@@ -70,6 +70,9 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
             BrokerGrpcRequest::FetchOffset(req) => {
                 BrokerGrpcResponse::FetchOffset(self.handle_fetch_offset(req).await)
             }
+            BrokerGrpcRequest::CreateTopic(req) => {
+                BrokerGrpcResponse::CreateTopic(self.handle_create_topic(req).await)
+            }
         };
         let _ = response_sender.send(response);
     }
@@ -117,6 +120,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                 // Produce each record in the partition batch
                 let mut last_offset = -1i64;
                 let mut error_code = 0i32;
+                let mut leader_addr = String::new();
                 for record in partition_data.records {
                     match self.storage.produce_message(
                         &topic_data.topic_name,
@@ -126,8 +130,14 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                     ).await {
                         Ok(offset) => { last_offset = offset; }
                         Err(e) => {
-                            log::error!("Failed to produce message: {}", e);
-                            error_code = 1;
+                            let err_str = e.to_string();
+                            if let Some(addr) = err_str.strip_prefix("NOT_LEADER:") {
+                                error_code = 6; // NOT_LEADER_FOR_PARTITION
+                                leader_addr = addr.to_string();
+                            } else {
+                                log::error!("Failed to produce message: {}", err_str);
+                                error_code = 1;
+                            }
                         }
                     }
                 }
@@ -135,6 +145,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                     partition: partition_data.partition,
                     error_code,
                     offset: last_offset,
+                    leader_addr,
                 });
             }
             results.push(produce_response::TopicResult {
@@ -239,7 +250,10 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
     }
 
     async fn handle_join_group(&self, request: JoinGroupRequest) -> JoinGroupResponse {
-        match self.storage.join_group(&request.group_id, &request.member_id, &request.protocol_type).await {
+        let protocol_metadata = request.group_protocols.first()
+            .map(|p| p.protocol_metadata.clone())
+            .unwrap_or_default();
+        match self.storage.join_group(&request.group_id, &request.member_id, &request.protocol_type, &protocol_metadata, request.session_timeout as i64).await {
             Ok((generation_id, leader_id, member_id, members)) => {
                 let protocol = request.group_protocols.first()
                     .map(|p| p.protocol_name.clone())
@@ -277,6 +291,9 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
     async fn handle_sync_group(&self, request: SyncGroupRequest) -> SyncGroupResponse {
         match self.storage.sync_group(&request.group_id, request.generation_id, &request.member_id).await {
             Ok(member_assignment) => SyncGroupResponse { error_code: 0, member_assignment },
+            Err(e) if e == "REBALANCE_IN_PROGRESS" => {
+                SyncGroupResponse { error_code: 27, member_assignment: Vec::new() }
+            }
             Err(e) => {
                 log::error!("Failed to sync group: {}", e);
                 SyncGroupResponse { error_code: 1, member_assignment: Vec::new() }
@@ -287,6 +304,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
     async fn handle_heartbeat(&self, request: HeartbeatRequest) -> HeartbeatResponse {
         match self.storage.heartbeat(&request.group_id, request.generation_id, &request.member_id).await {
             Ok(_) => HeartbeatResponse { error_code: 0 },
+            Err(e) if e == "REBALANCE_IN_PROGRESS" => HeartbeatResponse { error_code: 27 },
             Err(e) => {
                 log::error!("Heartbeat failed: {}", e);
                 HeartbeatResponse { error_code: 1 }
@@ -337,6 +355,16 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
             });
         }
         OffsetCommitResponse { topics }
+    }
+
+    async fn handle_create_topic(&self, request: CreateTopicRequest) -> CreateTopicResponse {
+        match self.storage.create_topic(&request.topic_name, request.num_partitions).await {
+            Ok(_) => CreateTopicResponse { error_code: 0, error_message: String::new() },
+            Err(e) => {
+                log::error!("Failed to create topic: {}", e);
+                CreateTopicResponse { error_code: 1, error_message: e }
+            }
+        }
     }
 
     async fn handle_fetch_offset(&self, request: OffsetFetchRequest) -> OffsetFetchResponse {

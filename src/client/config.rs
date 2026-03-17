@@ -46,23 +46,31 @@ impl Default for BrokerConfig {
 pub struct ProducerConfig {
     /// Topic to produce to
     pub topic: String,
-    
-    /// Default partition
+
+    /// Default partition (used when partitioning = "fixed")
     #[serde(default)]
     pub partition: i32,
-    
+
+    /// Partitioning strategy: "fixed", "round_robin", or "key_hash"
+    #[serde(default = "default_partitioning")]
+    pub partitioning: String,
+
+    /// Number of partitions for round_robin / key_hash strategies
+    #[serde(default = "default_num_partitions")]
+    pub num_partitions: i32,
+
     /// Required acknowledgments (-1=all, 0=none, 1=leader)
     #[serde(default = "default_acks")]
     pub required_acks: i32,
-    
+
     /// Timeout for produce requests in milliseconds
     #[serde(default = "default_produce_timeout")]
     pub timeout_ms: i32,
-    
+
     /// Batch size for batching messages
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
-    
+
     /// Flush interval in milliseconds
     #[serde(default = "default_flush_interval")]
     pub flush_interval_ms: u64,
@@ -73,11 +81,11 @@ pub struct ProducerConfig {
 pub struct ConsumerConfig {
     /// Topic to consume from
     pub topic: String,
-    
-    /// Partition to consume from
-    #[serde(default)]
-    pub partition: i32,
-    
+
+    /// Partitions to consume from (default: [0])
+    #[serde(default = "default_partitions")]
+    pub partitions: Vec<i32>,
+
     /// Consumer group ID
     pub group_id: Option<String>,
     
@@ -159,6 +167,18 @@ fn default_poll_interval() -> u64 {
     1000
 }
 
+fn default_partitions() -> Vec<i32> {
+    vec![0]
+}
+
+fn default_partitioning() -> String {
+    "fixed".to_string()
+}
+
+fn default_num_partitions() -> i32 {
+    1
+}
+
 impl AppConfig {
     /// Load configuration from YAML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -183,6 +203,8 @@ impl AppConfig {
             producer: Some(ProducerConfig {
                 topic: topic.into(),
                 partition: 0,
+                partitioning: default_partitioning(),
+                num_partitions: default_num_partitions(),
                 required_acks: default_acks(),
                 timeout_ms: default_produce_timeout(),
                 batch_size: default_batch_size(),
@@ -191,7 +213,7 @@ impl AppConfig {
             consumer: None,
         }
     }
-    
+
     /// Create default consumer configuration
     pub fn default_consumer(topic: impl Into<String>, group_id: Option<String>) -> Self {
         Self {
@@ -199,7 +221,7 @@ impl AppConfig {
             producer: None,
             consumer: Some(ConsumerConfig {
                 topic: topic.into(),
-                partition: 0,
+                partitions: default_partitions(),
                 group_id,
                 offset: -2, // Start from earliest
                 max_bytes: default_max_bytes(),
@@ -252,7 +274,6 @@ broker:
 
 producer:
   topic: "my-topic"
-  partition: 0
   required_acks: 1
 "#;
         let config = AppConfig::from_yaml_str(yaml).unwrap();

@@ -1,239 +1,150 @@
-use async_trait::async_trait;
-use openraft::{
-    error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError},
-    network::{RaftNetwork, RaftNetworkFactory, RPCOption},
-    raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-        VoteRequest, VoteResponse,
-    },
-};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tonic::{transport::Channel, Request, Response, Status};
+use tokio::sync::{mpsc, Mutex};
+use tonic::{Request, Response, Status};
+// Use prost 0.11 (the version raft uses) to encode/decode eraftpb::Message
+use prost_raft::Message as RaftProstMessage;
 
-use crate::broker::raft_types::{BrokerNode, BrokerNodeId, TypeConfig};
-
-/// gRPC service definition for Raft communication
-pub mod raft_service {
+pub mod raft_proto {
     tonic::include_proto!("raft");
 }
 
-use raft_service::{
-    raft_client::RaftClient,
-    raft_server::{Raft, RaftServer},
-    RaftMessage, RaftReply,
-};
+use raft_proto::raft_client::RaftClient;
+use raft_proto::raft_server::Raft;
+use raft_proto::{RaftMessage, RaftReply};
+use raft::eraftpb::Message;
 
-/// Network implementation for Raft cluster communication
-#[derive(Clone)]
-pub struct BrokerRaftNetwork {
-    /// Node ID of this broker
-    node_id: BrokerNodeId,
-    
-    /// Connections to other nodes
-    connections: Arc<RwLock<HashMap<BrokerNodeId, Channel>>>,
+// ── Peer info ─────────────────────────────────────────────────────────────────
+
+/// Addresses for a single cluster peer.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    /// gRPC endpoint for Raft inter-broker messages (must include scheme, e.g. "http://…")
+    pub rpc_addr: String,
+    /// gRPC endpoint for client-facing API (e.g. "127.0.0.1:9092")
+    pub api_addr: String,
 }
 
-impl BrokerRaftNetwork {
-    pub fn new(node_id: BrokerNodeId) -> Self {
+// ── Outbound: send Raft messages to peers ─────────────────────────────────────
+
+/// Sends outgoing Raft protocol messages to peer brokers over gRPC.
+#[derive(Clone)]
+pub struct RaftNetworkSender {
+    node_id: u64,
+    /// node_id → peer addresses
+    peers: HashMap<u64, PeerInfo>,
+    /// Lazy connection pool keyed by node_id
+    pool: Arc<Mutex<HashMap<u64, RaftClient<tonic::transport::Channel>>>>,
+}
+
+impl RaftNetworkSender {
+    pub fn new(node_id: u64, peers: HashMap<u64, PeerInfo>) -> Self {
         Self {
             node_id,
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            peers,
+            pool: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-    
-    async fn get_connection(&self, target: BrokerNodeId, target_node: &BrokerNode) -> Result<Channel, NetworkError<BrokerNodeId>> {
-        let mut connections = self.connections.write().await;
-        
-        if let Some(channel) = connections.get(&target) {
-            return Ok(channel.clone());
-        }
-        
-        // Create new connection
-        let channel = Channel::from_shared(format!("http://{}", target_node.rpc_addr))
-            .map_err(|e| NetworkError::new(&e))?
-            .connect()
-            .await
-            .map_err(|e| NetworkError::new(&e))?;
-        
-        connections.insert(target, channel.clone());
-        Ok(channel)
+
+    /// Return the API address of a peer node (for leader-redirect hints).
+    pub fn peer_api_addr(&self, node_id: u64) -> Option<&str> {
+        self.peers.get(&node_id).map(|p| p.api_addr.as_str())
     }
-    
-    async fn send_rpc<Req, Resp>(
+
+    pub async fn send_messages(&self, msgs: Vec<Message>) {
+        for msg in msgs {
+            if msg.to == self.node_id {
+                continue; // never send to self
+            }
+            let Some(peer) = self.peers.get(&msg.to) else {
+                log::warn!("No address for peer node {}", msg.to);
+                continue;
+            };
+            let addr = peer.rpc_addr.clone();
+
+            let data = RaftProstMessage::encode_to_vec(&msg);
+            let request = RaftMessage {
+                rpc_type: "raft".into(),
+                data,
+            };
+
+            let client = self.get_or_connect(msg.to, addr).await;
+            match client {
+                Ok(mut c) => {
+                    if let Err(e) = c.send_raft(Request::new(request)).await {
+                        log::debug!("Failed to send raft message to node {}: {}", msg.to, e);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Could not connect to peer node {}: {}", msg.to, e);
+                }
+            }
+        }
+    }
+
+    async fn get_or_connect(
         &self,
-        target: BrokerNodeId,
-        target_node: &BrokerNode,
-        rpc: &str,
-        req: Req,
-    ) -> Result<Resp, RPCError<BrokerNodeId, BrokerNode, RaftError<BrokerNodeId>>>
-    where
-        Req: Serialize,
-        Resp: for<'a> Deserialize<'a>,
-    {
-        let channel = self.get_connection(target, target_node).await
-            .map_err(|e| RPCError::Network(e))?;
-        
-        let mut client = RaftClient::new(channel);
-        
-        let serialized = serde_json::to_vec(&req)
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        
-        let request = RaftMessage {
-            rpc_type: rpc.to_string(),
-            data: serialized,
-        };
-        
-        let response = client.send_raft(Request::new(request))
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
-            .into_inner();
-        
-        if !response.error.is_empty() {
-            return Err(RPCError::RemoteError(RemoteError::new(
-                target,
-                target_node.clone(),
-                RaftError::APIError(response.error),
-            )));
+        node_id: u64,
+        addr: String, // rpc_addr
+    ) -> anyhow::Result<RaftClient<tonic::transport::Channel>> {
+        let mut pool = self.pool.lock().await;
+        if let Some(client) = pool.get(&node_id) {
+            return Ok(client.clone());
         }
-        
-        let result = serde_json::from_slice(&response.data)
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        
-        Ok(result)
+        let endpoint = tonic::transport::Endpoint::from_shared(addr)?;
+        let channel = endpoint.connect_lazy();
+        let client = RaftClient::new(channel);
+        pool.insert(node_id, client.clone());
+        Ok(client)
     }
 }
 
-#[async_trait]
-impl RaftNetworkFactory<TypeConfig> for BrokerRaftNetwork {
-    type Network = BrokerRaftNetworkConnection;
+// ── Inbound: receive Raft messages from peers ─────────────────────────────────
 
-    async fn new_client(&mut self, target: BrokerNodeId, node: &BrokerNode) -> Self::Network {
-        BrokerRaftNetworkConnection {
-            target,
-            target_node: node.clone(),
-            network: self.clone(),
+/// tonic service implementation that receives Raft messages from peers
+/// and forwards them to the local RawNode via a channel.
+pub struct RaftServiceImpl {
+    step_tx: mpsc::UnboundedSender<Message>,
+}
+
+#[tonic::async_trait]
+impl Raft for RaftServiceImpl {
+    async fn send_raft(
+        &self,
+        request: Request<RaftMessage>,
+    ) -> Result<Response<RaftReply>, Status> {
+        let data = request.into_inner().data;
+        match <Message as RaftProstMessage>::decode(data.as_slice()) {
+            Ok(msg) => {
+                let _ = self.step_tx.send(msg);
+                Ok(Response::new(RaftReply::default()))
+            }
+            Err(e) => Err(Status::invalid_argument(format!("decode error: {}", e))),
         }
     }
 }
 
-pub struct BrokerRaftNetworkConnection {
-    target: BrokerNodeId,
-    target_node: BrokerNode,
-    network: BrokerRaftNetwork,
+// ── RaftGrpcServer ────────────────────────────────────────────────────────────
+
+/// Thin wrapper around the Raft tonic server. Call `serve()` to start listening.
+pub struct RaftGrpcServer {
+    service: RaftServiceImpl,
 }
 
-#[async_trait]
-impl RaftNetwork<TypeConfig> for BrokerRaftNetworkConnection {
-    async fn append_entries(
-        &mut self,
-        req: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<BrokerNodeId>, RPCError<BrokerNodeId, BrokerNode, RaftError<BrokerNodeId>>> {
-        self.network.send_rpc(self.target, &self.target_node, "append_entries", req).await
+impl RaftGrpcServer {
+    pub fn new(step_tx: mpsc::UnboundedSender<Message>) -> Self {
+        Self {
+            service: RaftServiceImpl { step_tx },
+        }
     }
 
-    async fn install_snapshot(
-        &mut self,
-        req: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
-    ) -> Result<InstallSnapshotResponse<BrokerNodeId>, RPCError<BrokerNodeId, BrokerNode, InstallSnapshotError>> {
-        self.network.send_rpc(self.target, &self.target_node, "install_snapshot", req).await
-            .map_err(|e| match e {
-                RPCError::RemoteError(remote_err) => {
-                    RPCError::RemoteError(RemoteError::new(
-                        remote_err.target,
-                        remote_err.target_node,
-                        InstallSnapshotError::from(remote_err.source.to_string()),
-                    ))
-                }
-                other => other.map_source(|_| InstallSnapshotError::from("RPC Error")),
-            })
+    pub async fn serve(self, addr: &str) -> anyhow::Result<()> {
+        let addr = addr.parse()?;
+        log::info!("Raft RPC server listening on {}", addr);
+        tonic::transport::Server::builder()
+            .add_service(raft_proto::raft_server::RaftServer::new(self.service))
+            .serve(addr)
+            .await?;
+        Ok(())
     }
-
-    async fn vote(
-        &mut self,
-        req: VoteRequest<BrokerNodeId>,
-        _option: RPCOption,
-    ) -> Result<VoteResponse<BrokerNodeId>, RPCError<BrokerNodeId, BrokerNode, RaftError<BrokerNodeId>>> {
-        self.network.send_rpc(self.target, &self.target_node, "vote", req).await
-    }
-}
-
-/// gRPC server implementation for Raft
-pub struct BrokerRaftService {
-    raft: Arc<openraft::Raft<TypeConfig>>,
-}
-
-impl BrokerRaftService {
-    pub fn new(raft: Arc<openraft::Raft<TypeConfig>>) -> Self {
-        Self { raft }
-    }
-}
-
-#[async_trait]
-impl Raft for BrokerRaftService {
-    async fn send_raft(&self, request: Request<RaftMessage>) -> Result<Response<RaftReply>, Status> {
-        let msg = request.into_inner();
-        
-        let reply = match msg.rpc_type.as_str() {
-            "append_entries" => {
-                let req: AppendEntriesRequest<TypeConfig> = serde_json::from_slice(&msg.data)
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
-                
-                match self.raft.append_entries(req).await {
-                    Ok(resp) => RaftReply {
-                        data: serde_json::to_vec(&resp).unwrap(),
-                        error: String::new(),
-                    },
-                    Err(e) => RaftReply {
-                        data: Vec::new(),
-                        error: e.to_string(),
-                    },
-                }
-            }
-            "vote" => {
-                let req: VoteRequest<BrokerNodeId> = serde_json::from_slice(&msg.data)
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
-                
-                match self.raft.vote(req).await {
-                    Ok(resp) => RaftReply {
-                        data: serde_json::to_vec(&resp).unwrap(),
-                        error: String::new(),
-                    },
-                    Err(e) => RaftReply {
-                        data: Vec::new(),
-                        error: e.to_string(),
-                    },
-                }
-            }
-            "install_snapshot" => {
-                let req: InstallSnapshotRequest<TypeConfig> = serde_json::from_slice(&msg.data)
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
-                
-                match self.raft.install_snapshot(req).await {
-                    Ok(resp) => RaftReply {
-                        data: serde_json::to_vec(&resp).unwrap(),
-                        error: String::new(),
-                    },
-                    Err(e) => RaftReply {
-                        data: Vec::new(),
-                        error: e.to_string(),
-                    },
-                }
-            }
-            _ => {
-                return Err(Status::unimplemented(format!("Unknown RPC type: {}", msg.rpc_type)));
-            }
-        };
-        
-        Ok(Response::new(reply))
-    }
-}
-
-/// Helper to create the gRPC server
-pub fn create_raft_grpc_server(raft: Arc<openraft::Raft<TypeConfig>>) -> RaftServer<BrokerRaftService> {
-    RaftServer::new(BrokerRaftService::new(raft))
 }

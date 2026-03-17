@@ -1,12 +1,13 @@
 use crate::api::broker::{
-    FetchResponse, GroupCoordinatorResponse, HeartbeatResponse, JoinGroupResponse,
-    LeaveGroupResponse, ListOffsetsResponse, OffsetCommitResponse, OffsetFetchResponse,
-    ProduceResponse, SyncGroupResponse, TopicMetadataResponse,
+    CreateTopicResponse, FetchResponse, GroupCoordinatorResponse, HeartbeatResponse,
+    JoinGroupResponse, LeaveGroupResponse, ListOffsetsResponse, OffsetCommitResponse,
+    OffsetFetchResponse, ProduceResponse, SyncGroupResponse, TopicMetadataResponse,
 };
 
 pub enum BrokerGrpcResponse {
     // Topic Management
     GetTopicMetadata(TopicMetadataResponse),
+    CreateTopic(CreateTopicResponse),
 
     // Producer Operations
     Produce(ProduceResponse),

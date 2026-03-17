@@ -64,6 +64,8 @@ async fn main() -> Result<()> {
     let producer_config = ProducerConfig {
         topic: "demo-topic".to_string(),
         partition: 0,
+        partitioning: "fixed".to_string(),
+        num_partitions: 1,
         required_acks: 1,
         timeout_ms: 5000,
         batch_size: 10,
@@ -81,7 +83,7 @@ async fn main() -> Result<()> {
     println!("Step 3: Creating consumer...");
     let consumer_config = ConsumerConfig {
         topic: "demo-topic".to_string(),
-        partition: 0,
+        partitions: vec![0],
         group_id: Some("demo-group".to_string()),
         offset: -2, // Start from earliest
         max_bytes: 1_048_576,

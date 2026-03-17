@@ -21,7 +21,11 @@ pub struct BrokerConfig {
     
     /// Raft configuration
     pub raft: RaftConfig,
-    
+
+    /// Message retention
+    #[serde(default)]
+    pub retention: RetentionConfig,
+
     /// Log level
     pub log_level: String,
 }
@@ -42,6 +46,15 @@ pub struct ClusterMember {
     pub node_id: u64,
     pub api_addr: String,
     pub rpc_addr: String,
+}
+
+/// Message retention configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetentionConfig {
+    /// Drop messages older than this many milliseconds (None = keep forever)
+    pub retention_ms: Option<u64>,
+    /// Maximum messages to keep per partition (None = unlimited)
+    pub max_messages_per_partition: Option<usize>,
 }
 
 /// Raft configuration
@@ -91,6 +104,7 @@ impl BrokerConfig {
                 election_timeout_max_ms: 6000,
                 snapshot_threshold: 10000,
             },
+            retention: RetentionConfig::default(),
             log_level: "info".to_string(),
         }
     }

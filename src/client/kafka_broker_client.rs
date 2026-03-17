@@ -35,6 +35,8 @@ pub trait KafkaBrokerClientTrait {
         -> Result<OffsetCommitResponse, Status>;
     async fn fetch_offset(&self, request: Request<OffsetFetchRequest>)
         -> Result<OffsetFetchResponse, Status>;
+    async fn create_topic(&self, request: Request<CreateTopicRequest>)
+        -> Result<CreateTopicResponse, Status>;
 }
 
 impl KafkaBrokerClient {
@@ -115,6 +117,12 @@ impl KafkaBrokerClientTrait for KafkaBrokerClient {
     async fn fetch_offset(&self, request: Request<OffsetFetchRequest>) -> Result<OffsetFetchResponse, Status> {
         let mut client = self.client.lock().await;
         let response = client.fetch_offset(request).await?;
+        Ok(response.into_inner())
+    }
+
+    async fn create_topic(&self, request: Request<CreateTopicRequest>) -> Result<CreateTopicResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.create_topic(request).await?;
         Ok(response.into_inner())
     }
 }

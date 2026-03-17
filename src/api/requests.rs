@@ -1,11 +1,12 @@
 use crate::api::broker::{
-    FetchRequest, GroupCoordinatorRequest, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest,
-    ListOffsetsRequest, OffsetCommitRequest, OffsetFetchRequest, ProduceRequest, SyncGroupRequest,
-    TopicMetadataRequest,
+    CreateTopicRequest, FetchRequest, GroupCoordinatorRequest, HeartbeatRequest, JoinGroupRequest,
+    LeaveGroupRequest, ListOffsetsRequest, OffsetCommitRequest, OffsetFetchRequest, ProduceRequest,
+    SyncGroupRequest, TopicMetadataRequest,
 };
 pub enum BrokerGrpcRequest {
     // Topic Management
     GetTopicMetadata(TopicMetadataRequest),
+    CreateTopic(CreateTopicRequest),
 
     // Producer Operations
     Produce(ProduceRequest),

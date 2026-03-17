@@ -75,7 +75,8 @@ async fn run_broker(args: Args) -> Result<()> {
     use broker::storage::InMemoryStorage;
     use broker::config::BrokerConfig;
     use broker::multi_broker::MultiBroker;
-    
+
+    // TODO: should create 2 function for multi and single
     // Check if a Raft config file is provided
     if let Some(config_path) = args.config {
         // Run as Raft multi-broker cluster
@@ -93,19 +94,35 @@ async fn run_broker(args: Args) -> Result<()> {
         log::info!("Starting multi-broker node {} on API: {}", 
             config.node_id, config.api_addr);
         
-        // Extract peer IDs from config
-        let peers: Vec<u64> = config.cluster.initial_members
+        // Build peer map: node_id → PeerInfo for all cluster members
+        use broker::raft_network::PeerInfo;
+        let peers: std::collections::HashMap<u64, PeerInfo> = config.cluster.initial_members
             .iter()
-            .map(|m| m.node_id)
+            .map(|m| (m.node_id, PeerInfo {
+                rpc_addr: format!("http://{}", m.rpc_addr),
+                api_addr: m.api_addr.clone(),
+            }))
             .collect();
-        
+
         let peer_count = peers.len();
-        
+
         // Create multi-broker with Raft
-        let multi_broker = MultiBroker::new(config.node_id, peers)
-            .map_err(|e| anyhow::anyhow!("Failed to create multi-broker: {}", e))?;
-        
+        let (multi_broker, raft_grpc_server) = MultiBroker::new(
+            config.node_id,
+            peers,
+            Some(config.storage_path.clone()),
+            Some(config.retention.clone()),
+        ).map_err(|e| anyhow::anyhow!("Failed to create multi-broker: {}", e))?;
+
         log::info!("Multi-broker initialized with {} peers", peer_count);
+
+        // Start Raft inter-broker RPC server on rpc_addr
+        let rpc_addr = config.rpc_addr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = raft_grpc_server.serve(&rpc_addr).await {
+                log::error!("Raft RPC server error: {}", e);
+            }
+        });
         
         // Create channel for RPC communication
         let (rpc_tx, rpc_rx) = mpsc::channel(1000);

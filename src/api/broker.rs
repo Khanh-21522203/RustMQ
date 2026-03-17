@@ -105,7 +105,7 @@ pub mod produce_response {
         #[prost(message, repeated, tag = "2")]
         pub partitions: ::prost::alloc::vec::Vec<PartitionResult>,
     }
-    #[derive(Clone, Copy, PartialEq, ::prost::Message)]
+    #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct PartitionResult {
         #[prost(int32, tag = "1")]
         pub partition: i32,
@@ -113,6 +113,9 @@ pub mod produce_response {
         pub error_code: i32,
         #[prost(int64, tag = "3")]
         pub offset: i64,
+        /// set when error_code = NOT_LEADER_FOR_PARTITION
+        #[prost(string, tag = "4")]
+        pub leader_addr: ::prost::alloc::string::String,
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -433,6 +436,20 @@ pub mod offset_fetch_response {
         #[prost(int32, tag = "4")]
         pub error_code: i32,
     }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateTopicRequest {
+    #[prost(string, tag = "1")]
+    pub topic_name: ::prost::alloc::string::String,
+    #[prost(int32, tag = "2")]
+    pub num_partitions: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateTopicResponse {
+    #[prost(int32, tag = "1")]
+    pub error_code: i32,
+    #[prost(string, tag = "2")]
+    pub error_message: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -837,6 +854,30 @@ pub mod broker_client {
             req.extensions_mut().insert(GrpcMethod::new("broker.Broker", "FetchOffset"));
             self.inner.unary(req, path, codec).await
         }
+        /// Topic Management
+        pub async fn create_topic(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateTopicRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateTopicResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/broker.Broker/CreateTopic",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("broker.Broker", "CreateTopic"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -926,6 +967,14 @@ pub mod broker_server {
             request: tonic::Request<super::OffsetFetchRequest>,
         ) -> std::result::Result<
             tonic::Response<super::OffsetFetchResponse>,
+            tonic::Status,
+        >;
+        /// Topic Management
+        async fn create_topic(
+            &self,
+            request: tonic::Request<super::CreateTopicRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateTopicResponse>,
             tonic::Status,
         >;
     }
@@ -1474,6 +1523,51 @@ pub mod broker_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = FetchOffsetSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/broker.Broker/CreateTopic" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateTopicSvc<T: Broker>(pub Arc<T>);
+                    impl<
+                        T: Broker,
+                    > tonic::server::UnaryService<super::CreateTopicRequest>
+                    for CreateTopicSvc<T> {
+                        type Response = super::CreateTopicResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CreateTopicRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Broker>::create_topic(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateTopicSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

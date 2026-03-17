@@ -56,6 +56,8 @@ async fn benchmark_producer_throughput(message_count: usize, message_size: usize
     let config = ProducerConfig {
         topic: "bench-topic".to_string(),
         partition: 0,
+        partitioning: "fixed".to_string(),
+        num_partitions: 1,
         required_acks: 1,
         timeout_ms: 5000,
         batch_size,
@@ -84,15 +86,17 @@ async fn benchmark_e2e_latency(message_count: usize) -> Result<(Duration, Vec<Du
     let producer_config = ProducerConfig {
         topic: "e2e-topic".to_string(),
         partition: 0,
+        partitioning: "fixed".to_string(),
+        num_partitions: 1,
         required_acks: 1,
         timeout_ms: 5000,
         batch_size: 1,
         flush_interval_ms: 10,
     };
-    
+
     let consumer_config = ConsumerConfig {
         topic: "e2e-topic".to_string(),
-        partition: 0,
+        partitions: vec![0],
         group_id: Some("bench-group".to_string()),
         offset: -2,
         max_bytes: 1_048_576,
@@ -144,6 +148,8 @@ async fn benchmark_consumer_throughput(message_count: usize) -> Result<(Duration
     let producer_config = ProducerConfig {
         topic: "consumer-bench-topic".to_string(),
         partition: 0,
+        partitioning: "fixed".to_string(),
+        num_partitions: 1,
         required_acks: 1,
         timeout_ms: 5000,
         batch_size: 100,
@@ -161,7 +167,7 @@ async fn benchmark_consumer_throughput(message_count: usize) -> Result<(Duration
     // Now benchmark consumer
     let consumer_config = ConsumerConfig {
         topic: "consumer-bench-topic".to_string(),
-        partition: 0,
+        partitions: vec![0],
         group_id: Some("consumer-bench-group".to_string()),
         offset: -2,
         max_bytes: 1_048_576,

@@ -130,4 +130,11 @@ impl broker_server::Broker for KafkaBrokerServer {
     ) -> Result<Response<OffsetFetchResponse>, Status> {
         dispatch!(self, FetchOffset, request)
     }
+
+    async fn create_topic(
+        &self,
+        request: Request<CreateTopicRequest>,
+    ) -> Result<Response<CreateTopicResponse>, Status> {
+        dispatch!(self, CreateTopic, request)
+    }
 }

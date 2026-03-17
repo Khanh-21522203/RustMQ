@@ -24,6 +24,9 @@ service Broker {
   // Offset Management
   rpc CommitOffset(OffsetCommitRequest) returns (OffsetCommitResponse);
   rpc FetchOffset(OffsetFetchRequest) returns (OffsetFetchResponse);
+
+  // Topic Management
+  rpc CreateTopic(CreateTopicRequest) returns (CreateTopicResponse);
 }
 
 // ==================== RECORDS ====================
@@ -102,6 +105,7 @@ message ProduceResponse {
     int32 partition = 1;
     int32 error_code = 2;
     int64 offset = 3;
+    string leader_addr = 4;  // set when error_code = NOT_LEADER_FOR_PARTITION
   }
 }
 
@@ -316,6 +320,18 @@ message OffsetFetchResponse {
     string metadata = 3;
     int32 error_code = 4;
   }
+}
+
+// ==================== TOPIC MANAGEMENT ====================
+
+message CreateTopicRequest {
+  string topic_name = 1;
+  int32 num_partitions = 2;
+}
+
+message CreateTopicResponse {
+  int32 error_code = 1;
+  string error_message = 2;
 }
 
 // ==================== ERROR CODES ====================
