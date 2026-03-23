@@ -7,6 +7,7 @@ cargo build --release
 
 # Create data directories
 mkdir -p data/broker-1 data/broker-2 data/broker-3
+mkdir -p logs
 
 echo "Starting 3-node Raft cluster..."
 

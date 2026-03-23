@@ -107,6 +107,12 @@ pub enum BrokerCommand {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RaftProposal {
+    proposal_id: u64,
+    command: BrokerCommand,
+}
+
 // ── RaftNode ────────────────────────────────────────────────────────────
 
 pub struct RaftNode {
@@ -117,6 +123,8 @@ pub struct RaftNode {
     network: RaftNetworkSender,
     is_leader: Arc<AtomicBool>,
     leader_id: Arc<AtomicU64>,
+    pending_replies: HashMap<u64, oneshot::Sender<anyhow::Result<i64>>>,
+    next_proposal_id: u64,
     db: Option<Arc<sled::Db>>,
     #[allow(dead_code)]
     logger: Logger,
@@ -179,6 +187,8 @@ impl RaftNode {
             network,
             is_leader: is_leader.clone(),
             leader_id: leader_id.clone(),
+            pending_replies: HashMap::new(),
+            next_proposal_id: 1,
             db,
             logger,
         };
@@ -207,12 +217,16 @@ impl RaftNode {
                         let _ = reply_tx.send(Err(anyhow::anyhow!("not leader")));
                         continue;
                     }
-                    match bincode::serialize(&cmd) {
+                    let proposal_id = self.next_proposal_id;
+                    self.next_proposal_id = self.next_proposal_id.wrapping_add(1);
+                    let proposal = RaftProposal { proposal_id, command: cmd };
+
+                    match bincode::serialize(&proposal) {
                         Ok(data) => {
                             if let Err(e) = self.raw_node.propose(vec![], data) {
                                 let _ = reply_tx.send(Err(anyhow::anyhow!("{:?}", e)));
                             } else {
-                                let _ = reply_tx.send(Ok(0));
+                                self.pending_replies.insert(proposal_id, reply_tx);
                             }
                         }
                         Err(e) => {
@@ -259,9 +273,7 @@ impl RaftNode {
         let committed: Vec<_> = ready.committed_entries().to_vec();
         for entry in committed {
             if entry.data.is_empty() { continue; }
-            if let Ok(cmd) = bincode::deserialize::<BrokerCommand>(&entry.data) {
-                self.apply_command(cmd).await;
-            }
+            self.apply_entry_data(&entry.data).await;
         }
 
         let mut light_rd = self.raw_node.advance(ready);
@@ -269,9 +281,7 @@ impl RaftNode {
         let light_committed: Vec<_> = light_rd.committed_entries().to_vec();
         for entry in light_committed {
             if entry.data.is_empty() { continue; }
-            if let Ok(cmd) = bincode::deserialize::<BrokerCommand>(&entry.data) {
-                self.apply_command(cmd).await;
-            }
+            self.apply_entry_data(&entry.data).await;
         }
 
         let light_msgs = light_rd.take_messages();
@@ -279,11 +289,36 @@ impl RaftNode {
 
         self.raw_node.advance_apply();
 
-        self.is_leader.store(
-            self.raw_node.raft.state == StateRole::Leader,
-            Ordering::SeqCst,
-        );
+        let was_leader = self.is_leader.load(Ordering::SeqCst);
+        let is_leader = self.raw_node.raft.state == StateRole::Leader;
+        self.is_leader.store(is_leader, Ordering::SeqCst);
         self.leader_id.store(self.raw_node.raft.leader_id, Ordering::SeqCst);
+        if was_leader && !is_leader {
+            self.fail_pending_replies("leadership changed before commit");
+        }
+    }
+
+    async fn apply_entry_data(&mut self, data: &[u8]) {
+        // Preferred format with proposal id for commit-aware acknowledgments.
+        if let Ok(proposal) = bincode::deserialize::<RaftProposal>(data) {
+            let result = self.apply_command(proposal.command).await;
+            if let Some(tx) = self.pending_replies.remove(&proposal.proposal_id) {
+                let _ = tx.send(Ok(result));
+            }
+            return;
+        }
+
+        // Backward compatibility: older entries serialized only BrokerCommand.
+        if let Ok(cmd) = bincode::deserialize::<BrokerCommand>(data) {
+            let _ = self.apply_command(cmd).await;
+        }
+    }
+
+    fn fail_pending_replies(&mut self, reason: &str) {
+        let pending = std::mem::take(&mut self.pending_replies);
+        for (_, tx) in pending {
+            let _ = tx.send(Err(anyhow::anyhow!(reason.to_string())));
+        }
     }
 
     async fn apply_command(&self, cmd: BrokerCommand) -> i64 {

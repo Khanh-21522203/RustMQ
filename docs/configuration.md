@@ -127,8 +127,8 @@ consumer:
   # Topic to consume from.
   topic: "events"
 
-  # Partition to consume from.
-  partition: 0
+  # Partitions to consume from.
+  partitions: [0]
 
   # Consumer group ID. Used for offset persistence and group coordination.
   group_id: "my-consumer-group"

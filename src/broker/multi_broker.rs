@@ -3,11 +3,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use tonic::Request;
 
+use crate::api::broker::HeartbeatRequest;
 use crate::broker::config::RetentionConfig;
-use crate::broker::raft_network::{PeerInfo, RaftGrpcServer};
 use crate::broker::raft::{GroupStatus, RaftNode, RaftStorage};
+use crate::broker::raft_network::{PeerInfo, RaftGrpcServer};
 use crate::broker::storage::{BrokerStorage, GroupMember, StoredMessage};
+use crate::client::kafka_broker_client::{KafkaBrokerClient, KafkaBrokerClientTrait};
 
 /// Local (non-replicated) heartbeat timestamps: (group_id, member_id) → last_heartbeat_ms
 struct LocalState {
@@ -145,6 +148,34 @@ impl MultiBroker {
 
         Ok((broker, raft_grpc_server))
     }
+
+    async fn forward_heartbeat_to_leader(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<(), String> {
+        let leader_addr = self
+            .raft_storage
+            .leader_api_addr()
+            .ok_or_else(|| "NOT_LEADER:".to_string())?;
+        let client = KafkaBrokerClient::new(&leader_addr)
+            .await
+            .map_err(|e| format!("NOT_LEADER:{} ({})", leader_addr, e))?;
+        let req = Request::new(HeartbeatRequest {
+            group_id: group_id.to_string(),
+            generation_id: 0,
+            member_id: member_id.to_string(),
+        });
+        let resp = client
+            .heartbeat(req)
+            .await
+            .map_err(|e| format!("Failed to forward heartbeat to leader {}: {}", leader_addr, e))?;
+        match resp.error_code {
+            0 => Ok(()),
+            27 => Err("REBALANCE_IN_PROGRESS".to_string()),
+            code => Err(format!("Heartbeat error_code={} from leader {}", code, leader_addr)),
+        }
+    }
 }
 
 #[async_trait]
@@ -269,6 +300,12 @@ impl BrokerStorage for MultiBroker {
     }
 
     async fn heartbeat(&self, group_id: &str, _generation_id: i32, member_id: &str) -> Result<(), String> {
+        // Followers forward heartbeats to the active leader so leader-side expiry
+        // logic always observes the latest member liveness.
+        if !self.raft_storage.is_leader() {
+            return self.forward_heartbeat_to_leader(group_id, member_id).await;
+        }
+
         // Update local heartbeat timestamp
         {
             let mut local = self.local.write().await;

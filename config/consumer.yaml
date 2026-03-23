@@ -9,8 +9,8 @@ consumer:
   # Topic to consume messages from
   topic: "events"
   
-  # Partition to consume from (0-based)
-  partition: 0
+  # Partitions to consume from (0-based)
+  partitions: [0]
   
   # Consumer group ID for offset management
   # Leave empty or null for no consumer group

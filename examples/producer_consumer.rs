@@ -7,15 +7,24 @@
 /// 4. Demonstrates graceful shutdown
 
 use anyhow::Result;
-use rust_mq::broker::{kafka_broker_server::KafkaBrokerServer, core::BrokerCore, storage::InMemoryStorage};
+use rust_mq::broker::{core::BrokerCore, kafka_broker_server::KafkaBrokerServer, storage::InMemoryStorage};
 use rust_mq::client::{
-    Producer, Consumer, ProducerConfig, ConsumerConfig,
-    ProducerMessage, ConsumedMessage, MessageHandler,
+    ConsumedMessage, Consumer, ConsumerConfig, MessageHandler, Producer, ProducerConfig,
+    ProducerMessage,
 };
+use rust_mq::codec::{decode, encode, MessageEnvelope};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DemoPayload {
+    sequence: u32,
+    content: String,
+    source: String,
+}
 
 /// Custom message handler that counts processed messages
 struct CountingHandler {
@@ -26,17 +35,21 @@ struct CountingHandler {
 impl MessageHandler for CountingHandler {
     async fn handle(&self, message: ConsumedMessage) -> Result<()> {
         let count = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let value = message.value_as_string()?;
-        
+        let envelope: MessageEnvelope<DemoPayload> = decode(&message.value)?;
+
         println!(
-            "[Consumer] Message #{}: [{}:{}:{}] {}",
+            "[Consumer] Message #{}: [{}:{}:{}] event={} v{} seq={} source={} content={}",
             count,
             message.topic,
             message.partition,
             message.offset,
-            value
+            envelope.event_type,
+            envelope.schema_version,
+            envelope.payload.sequence,
+            envelope.payload.source,
+            envelope.payload.content
         );
-        
+
         Ok(())
     }
 }
@@ -112,14 +125,19 @@ async fn main() -> Result<()> {
     // 4. Send messages
     println!("Step 4: Sending messages...");
     println!("----------------------------------");
-    
+
     for i in 1..=20 {
-        let message = format!("Message number {}", i);
-        let msg = ProducerMessage::new(message.as_bytes().to_vec());
-        
+        let payload = DemoPayload {
+            sequence: i,
+            content: format!("Message number {}", i),
+            source: "batch-producer".to_string(),
+        };
+        let envelope = MessageEnvelope::new("demo.message", 1, payload.clone());
+        let msg = ProducerMessage::new(encode(&envelope)?);
+
         producer.send(msg).await?;
-        println!("[Producer] Sent: {}", message);
-        
+        println!("[Producer] Sent: {}", payload.content);
+
         // Small delay to make output readable
         sleep(Duration::from_millis(100)).await;
     }
@@ -144,8 +162,14 @@ async fn main() -> Result<()> {
     
     // 6. Demonstrate synchronous send
     println!("Step 6: Demonstrating synchronous send...");
+    let sync_payload = DemoPayload {
+        sequence: 21,
+        content: "Synchronous message".to_string(),
+        source: "sync-producer".to_string(),
+    };
+    let sync_envelope = MessageEnvelope::new("demo.sync", 1, sync_payload);
     let result = producer.send_sync(
-        ProducerMessage::new(b"Synchronous message")
+        ProducerMessage::new(encode(&sync_envelope)?)
     ).await?;
     
     println!(

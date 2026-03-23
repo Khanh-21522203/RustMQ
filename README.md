@@ -152,7 +152,7 @@ impl MessageHandler for MyHandler {
 async fn main() -> anyhow::Result<()> {
     let config = ConsumerConfig {
         topic: "my-topic".to_string(),
-        partition: 0,
+        partitions: vec![0],
         group_id: Some("my-group".to_string()),
         offset: -2,
         max_bytes: 1_048_576,
@@ -170,6 +170,36 @@ async fn main() -> anyhow::Result<()> {
     consumer.shutdown().await?;
     Ok(())
 }
+```
+
+### Structured Payload Encoding/Decoding
+
+Rust-MQ stores message values as raw bytes. You can use the built-in codec
+module to wrap your payload with a simple versioned envelope:
+
+```rust
+use serde::{Deserialize, Serialize};
+use rust_mq::codec::{MessageEnvelope, encode, decode};
+use rust_mq::client::ProducerMessage;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OrderCreated {
+    order_id: String,
+    amount_cents: u64,
+}
+
+// Encode before produce
+let envelope = MessageEnvelope::new(
+    "order.created",
+    1,
+    OrderCreated { order_id: "ORD-1001".into(), amount_cents: 1250 },
+);
+let bytes = encode(&envelope)?; // compact binary (bincode)
+producer.send(ProducerMessage::new(bytes)).await?;
+
+// Decode after consume
+let decoded: MessageEnvelope<OrderCreated> = decode(&consumed_message.value)?;
+println!("event={} order={}", decoded.event_type, decoded.payload.order_id);
 ```
 
 ## Configuration
@@ -198,7 +228,7 @@ producer:
 
 consumer:
   topic: "events"
-  partition: 0
+  partitions: [0]
   group_id: "my-consumer-group"
   offset: -2  # -2=earliest, -1=latest, 0+=specific
   max_bytes: 1048576

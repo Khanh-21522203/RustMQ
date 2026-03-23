@@ -21,7 +21,7 @@ producer:
 
 consumer:
   topic: "my-topic"
-  partition: 0
+  partitions: [0]
   group_id: "consumer-group-1"
   offset: -2
   max_bytes: 1048576
