@@ -1,0 +1,54 @@
+services:
+  broker-1:
+    build: .
+    command: ["--mode", "broker", "--config", "/app/config/docker/broker-1.yaml"]
+    ports:
+      - "9092:9092"
+      - "19092:19092"
+    volumes:
+      - broker1-data:/data/broker-1
+    networks:
+      - rustmq
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c 'cat /dev/null > /dev/tcp/localhost/9092' 2>/dev/null && echo ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  broker-2:
+    build: .
+    command: ["--mode", "broker", "--config", "/app/config/docker/broker-2.yaml"]
+    ports:
+      - "9093:9092"
+      - "19093:19092"
+    volumes:
+      - broker2-data:/data/broker-2
+    networks:
+      - rustmq
+    depends_on:
+      broker-1:
+        condition: service_healthy
+
+  broker-3:
+    build: .
+    command: ["--mode", "broker", "--config", "/app/config/docker/broker-3.yaml"]
+    ports:
+      - "9094:9092"
+      - "19094:19092"
+    volumes:
+      - broker3-data:/data/broker-3
+    networks:
+      - rustmq
+    depends_on:
+      broker-1:
+        condition: service_healthy
+
+volumes:
+  broker1-data:
+  broker2-data:
+  broker3-data:
+
+networks:
+  rustmq:
+    driver: bridge

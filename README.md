@@ -24,7 +24,7 @@ Rust-MQ supports two deployment modes:
 - **Single Broker**: Simple in-memory storage for development and testing
 - **Multi-Broker Cluster**: Distributed system with Raft consensus for production
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation with diagrams.  
+See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation with diagrams.  
 
 ## Quick Start
 
@@ -116,6 +116,8 @@ async fn main() -> anyhow::Result<()> {
     let config = ProducerConfig {
         topic: "my-topic".to_string(),
         partition: 0,
+        partitioning: "fixed".to_string(),
+        num_partitions: 1,
         required_acks: 1,
         timeout_ms: 5000,
         batch_size: 100,
@@ -221,6 +223,8 @@ broker:
 producer:
   topic: "events"
   partition: 0
+  partitioning: "fixed"
+  num_partitions: 1
   required_acks: 1
   timeout_ms: 5000
   batch_size: 100

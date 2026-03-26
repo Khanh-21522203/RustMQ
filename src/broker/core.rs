@@ -1,8 +1,8 @@
-use tokio::sync::{mpsc, oneshot};
+use crate::api::broker::*;
 use crate::api::requests::BrokerGrpcRequest;
 use crate::api::responses::BrokerGrpcResponse;
-use crate::api::broker::*;
 use crate::broker::storage::BrokerStorage;
+use tokio::sync::{mpsc, oneshot};
 
 pub struct BrokerCore<S: BrokerStorage> {
     rpc_receive_channel: mpsc::Receiver<(BrokerGrpcRequest, oneshot::Sender<BrokerGrpcResponse>)>,
@@ -11,10 +11,16 @@ pub struct BrokerCore<S: BrokerStorage> {
 
 impl<S: BrokerStorage + 'static> BrokerCore<S> {
     pub fn new(
-        rpc_receive_channel: mpsc::Receiver<(BrokerGrpcRequest, oneshot::Sender<BrokerGrpcResponse>)>,
+        rpc_receive_channel: mpsc::Receiver<(
+            BrokerGrpcRequest,
+            oneshot::Sender<BrokerGrpcResponse>,
+        )>,
         storage: S,
     ) -> Self {
-        Self { rpc_receive_channel, storage }
+        Self {
+            rpc_receive_channel,
+            storage,
+        }
     }
 
     pub async fn run(mut self) {
@@ -77,7 +83,10 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         let _ = response_sender.send(response);
     }
 
-    async fn handle_get_topic_metadata(&self, request: TopicMetadataRequest) -> TopicMetadataResponse {
+    async fn handle_get_topic_metadata(
+        &self,
+        request: TopicMetadataRequest,
+    ) -> TopicMetadataResponse {
         let topics = if request.topics.is_empty() {
             self.storage.get_topics().await
         } else {
@@ -87,16 +96,17 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         let mut topic_metadata = Vec::new();
         for topic_name in topics {
             if let Some(partitions) = self.storage.get_topic_partitions(&topic_name).await {
-                let partition_metadata: Vec<topic_metadata_response::PartitionMetadata> = partitions
-                    .iter()
-                    .map(|&partition_id| topic_metadata_response::PartitionMetadata {
-                        partition_error_code: 0,
-                        partition_id,
-                        leader: 1,
-                        replicas: vec![1],
-                        isr: vec![1],
-                    })
-                    .collect();
+                let partition_metadata: Vec<topic_metadata_response::PartitionMetadata> =
+                    partitions
+                        .iter()
+                        .map(|&partition_id| topic_metadata_response::PartitionMetadata {
+                            partition_error_code: 0,
+                            partition_id,
+                            leader: 1,
+                            replicas: vec![1],
+                            isr: vec![1],
+                        })
+                        .collect();
                 topic_metadata.push(topic_metadata_response::TopicMetadata {
                     topic_error_code: 0,
                     topic_name,
@@ -107,7 +117,11 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
 
         let (broker_id, host, port) = self.storage.get_coordinator_info().await;
         TopicMetadataResponse {
-            brokers: vec![topic_metadata_response::Broker { node_id: broker_id, host, port }],
+            brokers: vec![topic_metadata_response::Broker {
+                node_id: broker_id,
+                host,
+                port,
+            }],
             topics: topic_metadata,
         }
     }
@@ -122,13 +136,19 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                 let mut error_code = 0i32;
                 let mut leader_addr = String::new();
                 for record in partition_data.records {
-                    match self.storage.produce_message(
-                        &topic_data.topic_name,
-                        partition_data.partition,
-                        record.key,
-                        record.value,
-                    ).await {
-                        Ok(offset) => { last_offset = offset; }
+                    match self
+                        .storage
+                        .produce_message(
+                            &topic_data.topic_name,
+                            partition_data.partition,
+                            record.key,
+                            record.value,
+                        )
+                        .await
+                    {
+                        Ok(offset) => {
+                            last_offset = offset;
+                        }
                         Err(e) => {
                             let err_str = e.to_string();
                             if let Some(addr) = err_str.strip_prefix("NOT_LEADER:") {
@@ -161,14 +181,20 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
             for partition_data in topic_data.partitions {
-                match self.storage.fetch_messages(
-                    &topic_data.topic_name,
-                    partition_data.partition,
-                    partition_data.fetch_offset,
-                    partition_data.max_bytes,
-                ).await {
+                match self
+                    .storage
+                    .fetch_messages(
+                        &topic_data.topic_name,
+                        partition_data.partition,
+                        partition_data.fetch_offset,
+                        partition_data.max_bytes,
+                    )
+                    .await
+                {
                     Ok(messages) => {
-                        let high_watermark = messages.last().map_or(partition_data.fetch_offset, |m| m.offset + 1);
+                        let high_watermark = messages
+                            .last()
+                            .map_or(partition_data.fetch_offset, |m| m.offset + 1);
                         let records: Vec<FetchedRecord> = messages
                             .into_iter()
                             .map(|m| FetchedRecord {
@@ -208,11 +234,15 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         for topic_data in request.topics {
             let mut partition_offsets = Vec::new();
             for partition_data in topic_data.partitions {
-                match self.storage.get_partition_offset(
-                    &topic_data.topic_name,
-                    partition_data.partition,
-                    partition_data.time,
-                ).await {
+                match self
+                    .storage
+                    .get_partition_offset(
+                        &topic_data.topic_name,
+                        partition_data.partition,
+                        partition_data.time,
+                    )
+                    .await
+                {
                     Ok(offsets) => {
                         partition_offsets.push(list_offsets_response::PartitionOffsets {
                             partition: partition_data.partition,
@@ -238,7 +268,10 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         ListOffsetsResponse { topics }
     }
 
-    async fn handle_find_coordinator(&self, _request: GroupCoordinatorRequest) -> GroupCoordinatorResponse {
+    async fn handle_find_coordinator(
+        &self,
+        _request: GroupCoordinatorRequest,
+    ) -> GroupCoordinatorResponse {
         let (coordinator_id, coordinator_host, coordinator_port) =
             self.storage.get_coordinator_info().await;
         GroupCoordinatorResponse {
@@ -250,12 +283,26 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
     }
 
     async fn handle_join_group(&self, request: JoinGroupRequest) -> JoinGroupResponse {
-        let protocol_metadata = request.group_protocols.first()
+        let protocol_metadata = request
+            .group_protocols
+            .first()
             .map(|p| p.protocol_metadata.clone())
             .unwrap_or_default();
-        match self.storage.join_group(&request.group_id, &request.member_id, &request.protocol_type, &protocol_metadata, request.session_timeout as i64).await {
+        match self
+            .storage
+            .join_group(
+                &request.group_id,
+                &request.member_id,
+                &request.protocol_type,
+                &protocol_metadata,
+                request.session_timeout as i64,
+            )
+            .await
+        {
             Ok((generation_id, leader_id, member_id, members)) => {
-                let protocol = request.group_protocols.first()
+                let protocol = request
+                    .group_protocols
+                    .first()
                     .map(|p| p.protocol_name.clone())
                     .unwrap_or_default();
                 let member_list: Vec<join_group_response::Member> = members
@@ -289,20 +336,35 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
     }
 
     async fn handle_sync_group(&self, request: SyncGroupRequest) -> SyncGroupResponse {
-        match self.storage.sync_group(&request.group_id, request.generation_id, &request.member_id).await {
-            Ok(member_assignment) => SyncGroupResponse { error_code: 0, member_assignment },
-            Err(e) if e == "REBALANCE_IN_PROGRESS" => {
-                SyncGroupResponse { error_code: 27, member_assignment: Vec::new() }
-            }
+        match self
+            .storage
+            .sync_group(&request.group_id, request.generation_id, &request.member_id)
+            .await
+        {
+            Ok(member_assignment) => SyncGroupResponse {
+                error_code: 0,
+                member_assignment,
+            },
+            Err(e) if e == "REBALANCE_IN_PROGRESS" => SyncGroupResponse {
+                error_code: 27,
+                member_assignment: Vec::new(),
+            },
             Err(e) => {
                 log::error!("Failed to sync group: {}", e);
-                SyncGroupResponse { error_code: 1, member_assignment: Vec::new() }
+                SyncGroupResponse {
+                    error_code: 1,
+                    member_assignment: Vec::new(),
+                }
             }
         }
     }
 
     async fn handle_heartbeat(&self, request: HeartbeatRequest) -> HeartbeatResponse {
-        match self.storage.heartbeat(&request.group_id, request.generation_id, &request.member_id).await {
+        match self
+            .storage
+            .heartbeat(&request.group_id, request.generation_id, &request.member_id)
+            .await
+        {
             Ok(_) => HeartbeatResponse { error_code: 0 },
             Err(e) if e == "REBALANCE_IN_PROGRESS" => HeartbeatResponse { error_code: 27 },
             Err(e) => {
@@ -313,7 +375,11 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
     }
 
     async fn handle_leave_group(&self, request: LeaveGroupRequest) -> LeaveGroupResponse {
-        match self.storage.leave_group(&request.group_id, &request.member_id).await {
+        match self
+            .storage
+            .leave_group(&request.group_id, &request.member_id)
+            .await
+        {
             Ok(_) => LeaveGroupResponse { error_code: 0 },
             Err(e) => {
                 log::error!("Failed to leave group: {}", e);
@@ -327,13 +393,17 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
             for partition_data in topic_data.partitions {
-                match self.storage.commit_offset(
-                    &request.consumer_group_id,
-                    &topic_data.topic_name,
-                    partition_data.partition,
-                    partition_data.offset,
-                    partition_data.metadata,
-                ).await {
+                match self
+                    .storage
+                    .commit_offset(
+                        &request.consumer_group_id,
+                        &topic_data.topic_name,
+                        partition_data.partition,
+                        partition_data.offset,
+                        partition_data.metadata,
+                    )
+                    .await
+                {
                     Ok(_) => {
                         partition_results.push(offset_commit_response::PartitionResult {
                             partition: partition_data.partition,
@@ -358,11 +428,21 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
     }
 
     async fn handle_create_topic(&self, request: CreateTopicRequest) -> CreateTopicResponse {
-        match self.storage.create_topic(&request.topic_name, request.num_partitions).await {
-            Ok(_) => CreateTopicResponse { error_code: 0, error_message: String::new() },
+        match self
+            .storage
+            .create_topic(&request.topic_name, request.num_partitions)
+            .await
+        {
+            Ok(_) => CreateTopicResponse {
+                error_code: 0,
+                error_message: String::new(),
+            },
             Err(e) => {
                 log::error!("Failed to create topic: {}", e);
-                CreateTopicResponse { error_code: 1, error_message: e }
+                CreateTopicResponse {
+                    error_code: 1,
+                    error_message: e,
+                }
             }
         }
     }
@@ -372,11 +452,15 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
             for partition in topic_data.partitions {
-                match self.storage.fetch_offset(
-                    &request.consumer_group_id,
-                    &topic_data.topic_name,
-                    partition,
-                ).await {
+                match self
+                    .storage
+                    .fetch_offset(
+                        &request.consumer_group_id,
+                        &topic_data.topic_name,
+                        partition,
+                    )
+                    .await
+                {
                     Ok((offset, metadata)) => {
                         partition_results.push(offset_fetch_response::PartitionResult {
                             partition,

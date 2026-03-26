@@ -1,16 +1,16 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use anyhow::{Context, Result};
 
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub broker: BrokerConfig,
-    
+
     #[serde(default)]
     pub producer: Option<ProducerConfig>,
-    
+
     #[serde(default)]
     pub consumer: Option<ConsumerConfig>,
 }
@@ -21,11 +21,11 @@ pub struct BrokerConfig {
     /// Broker address (e.g., "http://localhost:50051")
     #[serde(default = "default_broker_address")]
     pub address: String,
-    
+
     /// Connection timeout in seconds
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    
+
     /// Maximum retries for failed operations
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
@@ -88,31 +88,31 @@ pub struct ConsumerConfig {
 
     /// Consumer group ID
     pub group_id: Option<String>,
-    
+
     /// Starting offset (-2=earliest, -1=latest, >=0=specific offset)
     #[serde(default)]
     pub offset: i64,
-    
+
     /// Maximum bytes to fetch per request
     #[serde(default = "default_max_bytes")]
     pub max_bytes: i32,
-    
+
     /// Maximum wait time in milliseconds
     #[serde(default = "default_max_wait")]
     pub max_wait_ms: i32,
-    
+
     /// Minimum bytes to wait for
     #[serde(default = "default_min_bytes")]
     pub min_bytes: i32,
-    
+
     /// Auto-commit offsets
     #[serde(default)]
     pub auto_commit: bool,
-    
+
     /// Auto-commit interval in milliseconds
     #[serde(default = "default_auto_commit_interval")]
     pub auto_commit_interval_ms: u64,
-    
+
     /// Poll interval in milliseconds
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
@@ -182,20 +182,20 @@ fn default_num_partitions() -> i32 {
 impl AppConfig {
     /// Load configuration from YAML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref())
-            .context("Failed to read config file")?;
-        
-        let config: AppConfig = serde_yaml::from_str(&content)
-            .context("Failed to parse YAML config")?;
-        
+        let content =
+            std::fs::read_to_string(path.as_ref()).context("Failed to read config file")?;
+
+        let config: AppConfig =
+            serde_yaml::from_str(&content).context("Failed to parse YAML config")?;
+
         Ok(config)
     }
-    
+
     /// Load configuration from YAML string
     pub fn from_yaml_str(yaml: &str) -> Result<Self> {
         serde_yaml::from_str(yaml).context("Failed to parse YAML")
     }
-    
+
     /// Create default configuration
     pub fn default_producer(topic: impl Into<String>) -> Self {
         Self {
@@ -233,23 +233,45 @@ impl AppConfig {
             }),
         }
     }
-    
+
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
         if let Some(producer) = &self.producer {
             if producer.topic.is_empty() {
                 anyhow::bail!("Producer topic cannot be empty");
             }
+            validate_topic_name(&producer.topic)
+                .map_err(|e| anyhow::anyhow!("Producer config: {}", e))?;
         }
-        
+
         if let Some(consumer) = &self.consumer {
             if consumer.topic.is_empty() {
                 anyhow::bail!("Consumer topic cannot be empty");
             }
+            validate_topic_name(&consumer.topic)
+                .map_err(|e| anyhow::anyhow!("Consumer config: {}", e))?;
         }
-        
+
         Ok(())
     }
+}
+
+/// Validate a topic name. Only alphanumeric characters, '.', '-', and '_' are allowed.
+/// This mirrors the broker-side validation and prevents injection via sled key format.
+fn validate_topic_name(topic: &str) -> Result<(), String> {
+    if topic.is_empty() {
+        return Err("topic name cannot be empty".to_string());
+    }
+    if !topic
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return Err(format!(
+            "invalid topic name '{}': only alphanumeric characters, '.', '-', and '_' are allowed",
+            topic
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -260,9 +282,21 @@ mod tests {
     fn test_default_configs() {
         let producer_config = AppConfig::default_producer("test-topic");
         assert_eq!(producer_config.producer.unwrap().topic, "test-topic");
-        
+
         let consumer_config = AppConfig::default_consumer("test-topic", Some("group1".to_string()));
         assert_eq!(consumer_config.consumer.unwrap().topic, "test-topic");
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_topic_names() {
+        let mut cfg = AppConfig::default_producer("bad:topic");
+        assert!(cfg.validate().is_err());
+
+        cfg = AppConfig::default_producer("bad topic");
+        assert!(cfg.validate().is_err());
+
+        cfg = AppConfig::default_producer("good-topic.v2_ok");
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

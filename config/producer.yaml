@@ -11,6 +11,12 @@ producer:
   
   # Default partition (0-based)
   partition: 0
+
+  # Partitioning strategy: fixed, round_robin, key_hash
+  partitioning: "fixed"
+
+  # Number of partitions used by round_robin/key_hash
+  num_partitions: 1
   
   # Required acknowledgments:
   # -1 = all replicas (most reliable)

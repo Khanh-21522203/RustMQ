@@ -108,7 +108,7 @@ Wraps the Raft storage layer and implements `BrokerStorage`. Produces and offset
 
 ### Raft Consensus Layer
 
-**SimpleRaftNode** (`src/broker/simple_raft.rs`)
+**RaftNode** (`src/broker/raft.rs`)
 
 Wraps the [`raft`](https://crates.io/crates/raft) crate's `RawNode`. Manages the Raft tick loop (100ms interval), leadership election, log replication, and state machine application.
 

@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
-use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
-use tonic::{Request, Response, Status};
-use tonic::transport::Server;
 use crate::api::broker::*;
 use crate::api::requests::BrokerGrpcRequest;
 use crate::api::responses::BrokerGrpcResponse;
+use async_trait::async_trait;
+use std::net::SocketAddr;
+use tokio::sync::{mpsc, oneshot};
+use tonic::transport::Server;
+use tonic::{Request, Response, Status};
 
 pub struct KafkaBrokerServer {
     rpc_send_channel: mpsc::Sender<(BrokerGrpcRequest, oneshot::Sender<BrokerGrpcResponse>)>,

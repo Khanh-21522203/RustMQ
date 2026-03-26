@@ -1,11 +1,14 @@
-use raft::{Config, storage::MemStorage, RawNode, StateRole};
 use raft::eraftpb::{ConfState, Message};
-use slog::{Drain, Logger, o};
+use raft::{storage::MemStorage, Config, RawNode, StateRole};
+use serde::{Deserialize, Serialize};
+use slog::{o, Drain, Logger};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, RwLock};
-use serde::{Serialize, Deserialize};
 
 use crate::broker::raft_network::{PeerInfo, RaftGrpcServer, RaftNetworkSender};
 
@@ -22,6 +25,9 @@ pub struct BrokerData {
     pub topics: HashMap<String, i32>,
     /// group_id → replicated group state
     pub groups: HashMap<String, ReplicatedGroupState>,
+    /// (topic, partition) → next offset watermark; monotonically increasing, survives truncation
+    #[serde(default)]
+    pub next_offsets: HashMap<(String, i32), i64>,
 }
 
 /// Serializable stored message for Raft log.
@@ -154,19 +160,17 @@ impl RaftNode {
         let raw_node = RawNode::new(&config, storage, &logger)?;
 
         let (db, initial_data) = match storage_path {
-            Some(ref path) => {
-                match sled::open(path) {
-                    Ok(db) => {
-                        let data = load_broker_data_from_sled(&db);
-                        log::info!("Loaded BrokerData from sled at {}", path);
-                        (Some(Arc::new(db)), data)
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to open sled at {}: {}", path, e);
-                        (None, BrokerData::default())
-                    }
+            Some(ref path) => match sled::open(path) {
+                Ok(db) => {
+                    let data = load_broker_data_from_sled(&db);
+                    log::info!("Loaded BrokerData from sled at {}", path);
+                    (Some(Arc::new(db)), data)
                 }
-            }
+                Err(e) => {
+                    log::warn!("Failed to open sled at {}: {}", path, e);
+                    (None, BrokerData::default())
+                }
+            },
             None => (None, BrokerData::default()),
         };
 
@@ -272,7 +276,9 @@ impl RaftNode {
 
         let committed: Vec<_> = ready.committed_entries().to_vec();
         for entry in committed {
-            if entry.data.is_empty() { continue; }
+            if entry.data.is_empty() {
+                continue;
+            }
             self.apply_entry_data(&entry.data).await;
         }
 
@@ -280,7 +286,9 @@ impl RaftNode {
 
         let light_committed: Vec<_> = light_rd.committed_entries().to_vec();
         for entry in light_committed {
-            if entry.data.is_empty() { continue; }
+            if entry.data.is_empty() {
+                continue;
+            }
             self.apply_entry_data(&entry.data).await;
         }
 
@@ -292,7 +300,8 @@ impl RaftNode {
         let was_leader = self.is_leader.load(Ordering::SeqCst);
         let is_leader = self.raw_node.raft.state == StateRole::Leader;
         self.is_leader.store(is_leader, Ordering::SeqCst);
-        self.leader_id.store(self.raw_node.raft.leader_id, Ordering::SeqCst);
+        self.leader_id
+            .store(self.raw_node.raft.leader_id, Ordering::SeqCst);
         if was_leader && !is_leader {
             self.fail_pending_replies("leadership changed before commit");
         }
@@ -324,22 +333,62 @@ impl RaftNode {
     async fn apply_command(&self, cmd: BrokerCommand) -> i64 {
         let mut data = self.data.write().await;
         match cmd {
-            BrokerCommand::Produce { topic, partition, key, value } => {
+            BrokerCommand::Produce {
+                topic,
+                partition,
+                key,
+                value,
+            } => {
+                // Compute offset: use the high-watermark floor so offsets stay monotonic
+                // even after retention truncation empties the log.
+                let log_last = data
+                    .messages
+                    .get(&(topic.clone(), partition))
+                    .and_then(|l| l.last())
+                    .map(|m| m.offset + 1)
+                    .unwrap_or(0);
+                let hwm = data
+                    .next_offsets
+                    .entry((topic.clone(), partition))
+                    .or_insert(0);
+                let offset = (*hwm).max(log_last);
+                *hwm = offset + 1;
                 let log = data.messages.entry((topic.clone(), partition)).or_default();
-                let offset = log.len() as i64;
                 let ts = now_ms();
-                log.push(BrokerStoredMessage { offset, key: key.clone(), value: value.clone(), timestamp_ms: ts });
+                log.push(BrokerStoredMessage {
+                    offset,
+                    key: key.clone(),
+                    value: value.clone(),
+                    timestamp_ms: ts,
+                });
                 if let Some(db) = &self.db {
                     let sled_key = format!("msg:{topic}:{partition:010}:{offset:020}");
-                    let msg = BrokerStoredMessage { offset, key, value, timestamp_ms: ts };
+                    let msg = BrokerStoredMessage {
+                        offset,
+                        key,
+                        value,
+                        timestamp_ms: ts,
+                    };
                     if let Ok(bytes) = bincode::serialize(&msg) {
                         let _ = db.insert(sled_key.as_bytes(), bytes);
+                    }
+                    // Persist high-watermark so it survives broker restarts
+                    let hwm_key = format!("hwm:{topic}:{partition:010}");
+                    let next = offset + 1;
+                    if let Ok(bytes) = bincode::serialize(&next) {
+                        let _ = db.insert(hwm_key.as_bytes(), bytes);
                     }
                 }
                 offset
             }
-            BrokerCommand::CommitOffset { group_id, topic, partition, offset } => {
-                data.offsets.insert((group_id.clone(), topic.clone(), partition), offset);
+            BrokerCommand::CommitOffset {
+                group_id,
+                topic,
+                partition,
+                offset,
+            } => {
+                data.offsets
+                    .insert((group_id.clone(), topic.clone(), partition), offset);
                 if let Some(db) = &self.db {
                     let sled_key = format!("off:{group_id}:{topic}:{partition:010}");
                     if let Ok(bytes) = bincode::serialize(&offset) {
@@ -348,10 +397,14 @@ impl RaftNode {
                 }
                 offset
             }
-            BrokerCommand::CreateTopic { topic, num_partitions } => {
+            BrokerCommand::CreateTopic {
+                topic,
+                num_partitions,
+            } => {
                 data.topics.insert(topic.clone(), num_partitions);
                 for p in 0..num_partitions {
                     data.messages.entry((topic.clone(), p)).or_default();
+                    data.next_offsets.entry((topic.clone(), p)).or_insert(0);
                 }
                 if let Some(db) = &self.db {
                     let sled_key = format!("top:{topic}");
@@ -361,7 +414,11 @@ impl RaftNode {
                 }
                 0
             }
-            BrokerCommand::TruncatePartition { topic, partition, before_offset } => {
+            BrokerCommand::TruncatePartition {
+                topic,
+                partition,
+                before_offset,
+            } => {
                 if let Some(log) = data.messages.get_mut(&(topic.clone(), partition)) {
                     log.retain(|m| m.offset >= before_offset);
                     if let Some(db) = &self.db {
@@ -382,15 +439,24 @@ impl RaftNode {
                 }
                 0
             }
-            BrokerCommand::GroupJoin { group_id, member_id, topic, metadata, session_timeout_ms } => {
+            BrokerCommand::GroupJoin {
+                group_id,
+                member_id,
+                topic,
+                metadata,
+                session_timeout_ms,
+            } => {
                 // Snapshot topics before mutably borrowing groups
                 let topics_snapshot = data.topics.clone();
 
-                let group = data.groups.entry(group_id.clone()).or_insert_with(|| ReplicatedGroupState {
-                    session_timeout_ms,
-                    leader_id: member_id.clone(),
-                    ..Default::default()
-                });
+                let group =
+                    data.groups
+                        .entry(group_id.clone())
+                        .or_insert_with(|| ReplicatedGroupState {
+                            session_timeout_ms,
+                            leader_id: member_id.clone(),
+                            ..Default::default()
+                        });
 
                 let already_member = group.members.iter().any(|m| m.member_id == member_id);
 
@@ -402,7 +468,10 @@ impl RaftNode {
                         }
                     }
                 } else {
-                    group.members.push(ReplicatedGroupMember { member_id: member_id.clone(), metadata });
+                    group.members.push(ReplicatedGroupMember {
+                        member_id: member_id.clone(),
+                        metadata,
+                    });
                     group.subscriptions.insert(member_id.clone(), topic);
                     let has_existing = group.members.len() > 1;
                     if has_existing && group.status == GroupStatus::Stable {
@@ -421,7 +490,10 @@ impl RaftNode {
                 persist_group(&self.db, &group_id, group);
                 0
             }
-            BrokerCommand::GroupLeave { group_id, member_id } => {
+            BrokerCommand::GroupLeave {
+                group_id,
+                member_id,
+            } => {
                 let topics_snapshot = data.topics.clone();
                 if let Some(group) = data.groups.get_mut(&group_id) {
                     remove_member(group, &member_id);
@@ -436,7 +508,10 @@ impl RaftNode {
                 }
                 0
             }
-            BrokerCommand::GroupExpire { group_id, expired_ids } => {
+            BrokerCommand::GroupExpire {
+                group_id,
+                expired_ids,
+            } => {
                 if let Some(group) = data.groups.get_mut(&group_id) {
                     for id in &expired_ids {
                         remove_member(group, id);
@@ -510,7 +585,9 @@ fn compute_and_store_assignments(group: &mut ReplicatedGroupState, topics: &Hash
         let mut partitions: Vec<i32> = (0..num_parts).collect();
         partitions.sort();
         for (i, mid) in members.iter().enumerate() {
-            let assigned: Vec<i32> = partitions.iter().enumerate()
+            let assigned: Vec<i32> = partitions
+                .iter()
+                .enumerate()
                 .filter(|(pi, _)| pi % members.len() == i)
                 .map(|(_, &p)| p)
                 .collect();
@@ -549,7 +626,10 @@ fn load_broker_data_from_sled(db: &sled::Db) -> BrokerData {
                 let parts: Vec<&str> = key_str.splitn(4, ':').collect();
                 if parts.len() == 4 {
                     if let Ok(partition) = parts[2].parse::<i32>() {
-                        data.messages.entry((parts[1].to_string(), partition)).or_default().push(msg);
+                        data.messages
+                            .entry((parts[1].to_string(), partition))
+                            .or_default()
+                            .push(msg);
                     }
                 }
             }
@@ -561,10 +641,9 @@ fn load_broker_data_from_sled(db: &sled::Db) -> BrokerData {
 
     for item in db.scan_prefix(b"off:") {
         if let Ok((key, val)) = item {
-            if let (Ok(key_str), Ok(offset)) = (
-                std::str::from_utf8(&key),
-                bincode::deserialize::<i64>(&val),
-            ) {
+            if let (Ok(key_str), Ok(offset)) =
+                (std::str::from_utf8(&key), bincode::deserialize::<i64>(&val))
+            {
                 // key: "off:{group}:{topic}:{partition:010}"
                 let parts: Vec<&str> = key_str.splitn(4, ':').collect();
                 if parts.len() == 4 {
@@ -581,10 +660,9 @@ fn load_broker_data_from_sled(db: &sled::Db) -> BrokerData {
 
     for item in db.scan_prefix(b"top:") {
         if let Ok((key, val)) = item {
-            if let (Ok(key_str), Ok(num_parts)) = (
-                std::str::from_utf8(&key),
-                bincode::deserialize::<i32>(&val),
-            ) {
+            if let (Ok(key_str), Ok(num_parts)) =
+                (std::str::from_utf8(&key), bincode::deserialize::<i32>(&val))
+            {
                 // key: "top:{topic}"
                 if let Some(topic) = key_str.strip_prefix("top:") {
                     data.topics.insert(topic.to_string(), num_parts);
@@ -602,6 +680,27 @@ fn load_broker_data_from_sled(db: &sled::Db) -> BrokerData {
                 // key: "grp:{group_id}"
                 if let Some(group_id) = key_str.strip_prefix("grp:") {
                     data.groups.insert(group_id.to_string(), group);
+                }
+            }
+        }
+    }
+
+    // Load high-watermark offsets; key: "hwm:{topic}:{partition:010}"
+    for item in db.scan_prefix(b"hwm:") {
+        if let Ok((key, val)) = item {
+            if let (Ok(key_str), Ok(next)) =
+                (std::str::from_utf8(&key), bincode::deserialize::<i64>(&val))
+            {
+                let parts: Vec<&str> = key_str.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    if let Ok(partition) = parts[2].parse::<i32>() {
+                        let topic = parts[1].to_string();
+                        let entry = data
+                            .next_offsets
+                            .entry((topic, partition))
+                            .or_insert(0);
+                        *entry = (*entry).max(next);
+                    }
                 }
             }
         }
@@ -628,7 +727,9 @@ impl RaftStorage {
 
     pub fn leader_api_addr(&self) -> Option<String> {
         let lid = self.leader_id.load(Ordering::SeqCst);
-        if lid == 0 { return None; }
+        if lid == 0 {
+            return None;
+        }
         self.peers.get(&lid).map(|p| p.api_addr.clone())
     }
 
@@ -645,45 +746,119 @@ impl RaftStorage {
         self.propose_tx
             .send((cmd, tx))
             .map_err(|e| anyhow::anyhow!("channel closed: {}", e))?;
-        rx.await.map_err(|e| anyhow::anyhow!("reply channel closed: {}", e))?
+        rx.await
+            .map_err(|e| anyhow::anyhow!("reply channel closed: {}", e))?
     }
 
-    pub async fn propose_produce(&self, topic: String, partition: i32, key: Option<Vec<u8>>, value: Vec<u8>) -> anyhow::Result<i64> {
-        self.propose(BrokerCommand::Produce { topic, partition, key, value }).await
+    pub async fn propose_produce(
+        &self,
+        topic: String,
+        partition: i32,
+        key: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> anyhow::Result<i64> {
+        self.propose(BrokerCommand::Produce {
+            topic,
+            partition,
+            key,
+            value,
+        })
+        .await
     }
 
-    pub async fn propose_commit_offset(&self, group_id: String, topic: String, partition: i32, offset: i64) -> anyhow::Result<()> {
-        self.propose(BrokerCommand::CommitOffset { group_id, topic, partition, offset }).await?;
+    pub async fn propose_commit_offset(
+        &self,
+        group_id: String,
+        topic: String,
+        partition: i32,
+        offset: i64,
+    ) -> anyhow::Result<()> {
+        self.propose(BrokerCommand::CommitOffset {
+            group_id,
+            topic,
+            partition,
+            offset,
+        })
+        .await?;
         Ok(())
     }
 
-    pub async fn propose_create_topic(&self, topic: String, num_partitions: i32) -> anyhow::Result<()> {
-        self.propose(BrokerCommand::CreateTopic { topic, num_partitions }).await?;
+    pub async fn propose_create_topic(
+        &self,
+        topic: String,
+        num_partitions: i32,
+    ) -> anyhow::Result<()> {
+        self.propose(BrokerCommand::CreateTopic {
+            topic,
+            num_partitions,
+        })
+        .await?;
         Ok(())
     }
 
-    pub async fn propose_truncate(&self, topic: String, partition: i32, before_offset: i64) -> anyhow::Result<()> {
-        self.propose(BrokerCommand::TruncatePartition { topic, partition, before_offset }).await?;
+    pub async fn propose_truncate(
+        &self,
+        topic: String,
+        partition: i32,
+        before_offset: i64,
+    ) -> anyhow::Result<()> {
+        self.propose(BrokerCommand::TruncatePartition {
+            topic,
+            partition,
+            before_offset,
+        })
+        .await?;
         Ok(())
     }
 
-    pub async fn propose_group_join(&self, group_id: String, member_id: String, topic: String, metadata: Vec<u8>, session_timeout_ms: i64) -> anyhow::Result<()> {
-        self.propose(BrokerCommand::GroupJoin { group_id, member_id, topic, metadata, session_timeout_ms }).await?;
+    pub async fn propose_group_join(
+        &self,
+        group_id: String,
+        member_id: String,
+        topic: String,
+        metadata: Vec<u8>,
+        session_timeout_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.propose(BrokerCommand::GroupJoin {
+            group_id,
+            member_id,
+            topic,
+            metadata,
+            session_timeout_ms,
+        })
+        .await?;
         Ok(())
     }
 
-    pub async fn propose_group_leave(&self, group_id: String, member_id: String) -> anyhow::Result<()> {
-        self.propose(BrokerCommand::GroupLeave { group_id, member_id }).await?;
+    pub async fn propose_group_leave(
+        &self,
+        group_id: String,
+        member_id: String,
+    ) -> anyhow::Result<()> {
+        self.propose(BrokerCommand::GroupLeave {
+            group_id,
+            member_id,
+        })
+        .await?;
         Ok(())
     }
 
-    pub async fn propose_group_expire(&self, group_id: String, expired_ids: Vec<String>) -> anyhow::Result<()> {
-        self.propose(BrokerCommand::GroupExpire { group_id, expired_ids }).await?;
+    pub async fn propose_group_expire(
+        &self,
+        group_id: String,
+        expired_ids: Vec<String>,
+    ) -> anyhow::Result<()> {
+        self.propose(BrokerCommand::GroupExpire {
+            group_id,
+            expired_ids,
+        })
+        .await?;
         Ok(())
     }
 
     pub async fn propose_group_finalize(&self, group_id: String) -> anyhow::Result<()> {
-        self.propose(BrokerCommand::GroupFinalize { group_id }).await?;
+        self.propose(BrokerCommand::GroupFinalize { group_id })
+            .await?;
         Ok(())
     }
 }

@@ -5,28 +5,35 @@ use std::fs;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerConfig {
     /// Node ID for this broker
+    #[serde(default = "default_node_id")]
     pub node_id: u64,
-    
+
     /// API address for client connections
+    #[serde(default = "default_api_addr")]
     pub api_addr: String,
-    
+
     /// RPC address for Raft inter-node communication
+    #[serde(default = "default_rpc_addr")]
     pub rpc_addr: String,
-    
+
     /// Storage path for Raft data
+    #[serde(default = "default_storage_path")]
     pub storage_path: String,
-    
+
     /// Cluster configuration
-    pub cluster: ClusterConfig,
-    
+    #[serde(default)]
+    pub cluster: Option<ClusterConfig>,
+
     /// Raft configuration
-    pub raft: RaftConfig,
+    #[serde(default)]
+    pub raft: Option<RaftConfig>,
 
     /// Message retention
     #[serde(default)]
     pub retention: RetentionConfig,
 
     /// Log level
+    #[serde(default = "default_log_level")]
     pub log_level: String,
 }
 
@@ -35,8 +42,9 @@ pub struct BrokerConfig {
 pub struct ClusterConfig {
     /// Initial cluster members
     pub initial_members: Vec<ClusterMember>,
-    
+
     /// Whether to bootstrap a new cluster
+    #[serde(default)]
     pub bootstrap: bool,
 }
 
@@ -62,15 +70,58 @@ pub struct RetentionConfig {
 pub struct RaftConfig {
     /// Heartbeat interval in milliseconds
     pub heartbeat_interval_ms: u64,
-    
+
     /// Minimum election timeout in milliseconds
     pub election_timeout_min_ms: u64,
-    
+
     /// Maximum election timeout in milliseconds
     pub election_timeout_max_ms: u64,
-    
+
     /// Snapshot threshold (number of logs before snapshot)
     pub snapshot_threshold: u64,
+
+    /// How long to wait for all members to rejoin before forcing rebalance finalization (ms)
+    #[serde(default = "default_rebalance_timeout_ms")]
+    pub rebalance_timeout_ms: i64,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_ms: 1000,
+            election_timeout_min_ms: 3000,
+            election_timeout_max_ms: 6000,
+            snapshot_threshold: 10000,
+            rebalance_timeout_ms: default_rebalance_timeout_ms(),
+        }
+    }
+}
+
+/// Default rebalance timeout used by both single-node and cluster brokers.
+pub const DEFAULT_REBALANCE_TIMEOUT_MS: i64 = 30_000;
+
+fn default_rebalance_timeout_ms() -> i64 {
+    DEFAULT_REBALANCE_TIMEOUT_MS
+}
+
+fn default_node_id() -> u64 {
+    1
+}
+
+fn default_api_addr() -> String {
+    "127.0.0.1:50051".to_string()
+}
+
+fn default_rpc_addr() -> String {
+    "127.0.0.1:50052".to_string()
+}
+
+fn default_storage_path() -> String {
+    "./data/broker-1".to_string()
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 impl BrokerConfig {
@@ -80,33 +131,26 @@ impl BrokerConfig {
         let config = serde_yaml::from_str(&content)?;
         Ok(config)
     }
-    
+
     /// Create a default single-node configuration
     pub fn default_single_node() -> Self {
         Self {
             node_id: 1,
-            api_addr: "127.0.0.1:9092".to_string(),
-            rpc_addr: "127.0.0.1:19092".to_string(),
-            storage_path: "./data/broker-1".to_string(),
-            cluster: ClusterConfig {
-                initial_members: vec![
-                    ClusterMember {
-                        node_id: 1,
-                        api_addr: "127.0.0.1:9092".to_string(),
-                        rpc_addr: "127.0.0.1:19092".to_string(),
-                    }
-                ],
-                bootstrap: true,
-            },
-            raft: RaftConfig {
-                heartbeat_interval_ms: 1000,
-                election_timeout_min_ms: 3000,
-                election_timeout_max_ms: 6000,
-                snapshot_threshold: 10000,
-            },
+            api_addr: default_api_addr(),
+            rpc_addr: default_rpc_addr(),
+            storage_path: default_storage_path(),
+            cluster: None,
+            raft: None,
             retention: RetentionConfig::default(),
-            log_level: "info".to_string(),
+            log_level: default_log_level(),
         }
+    }
+
+    pub fn is_cluster_mode(&self) -> bool {
+        self.cluster
+            .as_ref()
+            .map(|c| !c.initial_members.is_empty())
+            .unwrap_or(false)
     }
 }
 

@@ -99,9 +99,14 @@ producer:
   # Topic to publish messages to.
   topic: "events"
 
-  # Target partition for all messages.
-  # Key-based partitioning is not yet automatic; specify the partition explicitly.
+  # Default partition (used when partitioning = "fixed").
   partition: 0
+
+  # Partitioning strategy: "fixed", "round_robin", or "key_hash".
+  partitioning: "fixed"
+
+  # Number of partitions for round_robin and key_hash.
+  num_partitions: 1
 
   # How many broker replicas must acknowledge a write.
   # -1 = all replicas (highest durability)

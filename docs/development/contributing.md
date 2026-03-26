@@ -66,11 +66,9 @@ src/
 │   ├── kafka_broker_server.rs # Tonic gRPC server
 │   ├── config.rs             # BrokerConfig deserialization
 │   ├── multi_broker.rs       # MultiBroker (Raft-backed BrokerStorage)
-│   ├── simple_raft.rs        # SimpleRaftNode wrapping raft crate
+│   ├── raft.rs               # RaftNode + replicated state machine + RaftStorage
 │   ├── raft_network.rs       # Inter-node gRPC communication
-│   ├── raft_state_machine.rs # Applies committed Raft entries
-│   ├── raft_storage.rs       # Raft log storage implementation
-│   └── raft_types.rs         # Raft data structures
+│   └── mod.rs
 └── client/                   # Client library
     ├── config.rs             # AppConfig, ProducerConfig, ConsumerConfig
     ├── producer.rs           # Producer with batching
@@ -95,8 +93,8 @@ Implement the `BrokerStorage` trait from `src/broker/storage.rs`:
 ```rust
 #[async_trait]
 impl BrokerStorage for MyStorage {
-    async fn produce_message(&self, ...) -> Result<u64> { ... }
-    async fn fetch_messages(&self, ...) -> Result<Vec<Message>> { ... }
+    async fn produce_message(&self, ...) -> Result<i64, String> { ... }
+    async fn fetch_messages(&self, ...) -> Result<Vec<StoredMessage>, String> { ... }
     // ... all other required methods
 }
 ```

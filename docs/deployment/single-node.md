@@ -35,12 +35,26 @@ cargo run --release -- --mode broker --config config/broker-single.yaml
 ### From the Library
 
 ```rust
-use rust_mq::broker::{BrokerConfig, run_broker};
+use rust_mq::broker::{
+    core::BrokerCore,
+    kafka_broker_server::KafkaBrokerServer,
+    storage::InMemoryStorage,
+};
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = BrokerConfig::default(); // localhost:50051
-    run_broker(config).await
+    let (rpc_tx, rpc_rx) = mpsc::channel(1000);
+    let storage = InMemoryStorage::new(1, "localhost".to_string(), 50051);
+    let broker_core = BrokerCore::new(rpc_rx, storage);
+
+    tokio::spawn(async move {
+        broker_core.run().await;
+    });
+
+    let grpc_server = KafkaBrokerServer::new(rpc_tx);
+    grpc_server.run("127.0.0.1:50051").await?;
+    Ok(())
 }
 ```
 

@@ -9,10 +9,10 @@ pub mod raft_proto {
     tonic::include_proto!("raft");
 }
 
+use raft::eraftpb::Message;
 use raft_proto::raft_client::RaftClient;
 use raft_proto::raft_server::Raft;
 use raft_proto::{RaftMessage, RaftReply};
-use raft::eraftpb::Message;
 
 // ── Peer info ─────────────────────────────────────────────────────────────────
 

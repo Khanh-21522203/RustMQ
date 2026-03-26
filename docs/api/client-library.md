@@ -18,10 +18,19 @@ tokio = { version = "1", features = ["full"] }
 ### Creating a Producer
 
 ```rust
-use rust_mq::client::{Producer, KafkaBrokerClient};
+use rust_mq::client::{Producer, ProducerConfig};
 
-let client = KafkaBrokerClient::connect("http://localhost:50051").await?;
-let producer = Producer::new(client, config);
+let config = ProducerConfig {
+    topic: "events".to_string(),
+    partition: 0,
+    partitioning: "fixed".to_string(),
+    num_partitions: 1,
+    required_acks: 1,
+    timeout_ms: 5000,
+    batch_size: 100,
+    flush_interval_ms: 100,
+};
+let producer = Producer::new("http://localhost:50051", config).await?;
 ```
 
 `config` is a `ProducerConfig` struct (see [Configuration](../configuration.md)).
@@ -46,14 +55,14 @@ producer.send(ProducerMessage {
 
 ```rust
 // Flush immediately and wait for broker acknowledgment.
-// Returns the assigned offset.
-let offset = producer.send_sync(ProducerMessage {
+// Returns partition + offset metadata.
+let result = producer.send_sync(ProducerMessage {
     key: None,
     value: b"urgent message".to_vec(),
     partition: None,
 }).await?;
 
-println!("Message stored at offset {}", offset);
+println!("Message stored at partition {} offset {}", result.partition, result.offset);
 ```
 
 #### Manual Flush
@@ -85,10 +94,21 @@ producer.shutdown().await?;
 ### Creating a Consumer
 
 ```rust
-use rust_mq::client::{Consumer, KafkaBrokerClient};
+use rust_mq::client::{Consumer, ConsumerConfig};
 
-let client = KafkaBrokerClient::connect("http://localhost:50051").await?;
-let consumer = Consumer::new(client, config);
+let config = ConsumerConfig {
+    topic: "events".to_string(),
+    partitions: vec![0],
+    group_id: Some("my-group".to_string()),
+    offset: -2,
+    max_bytes: 1_048_576,
+    max_wait_ms: 1000,
+    min_bytes: 1,
+    auto_commit: true,
+    auto_commit_interval_ms: 5000,
+    poll_interval_ms: 1000,
+};
+let mut consumer = Consumer::new("http://localhost:50051", config).await?;
 ```
 
 ### Implementing a Message Handler
@@ -145,7 +165,7 @@ loop {
 To move to a specific offset (bypasses committed offsets):
 
 ```rust
-consumer.seek(topic, partition, offset).await?;
+consumer.seek(partition, offset);
 ```
 
 ### Shutdown
@@ -174,15 +194,13 @@ Both `Producer` and `Consumer` return `anyhow::Result<T>` from async methods. Er
 - **Broker errors**: Unknown topic/partition, offset out of range, not leader
 - **Configuration errors**: Invalid settings
 
-Retries for transient errors (connection refused, timeout) are handled internally up to `max_retries` from the broker config.
-
 ---
 
 ## Complete Example
 
 ```rust
 use rust_mq::client::{
-    Consumer, KafkaBrokerClient, MessageHandler, ConsumedMessage, Producer, ProducerMessage,
+    Consumer, ConsumerConfig, MessageHandler, ConsumedMessage, Producer, ProducerConfig, ProducerMessage,
 };
 use async_trait::async_trait;
 
@@ -198,10 +216,19 @@ impl MessageHandler for PrintHandler {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = KafkaBrokerClient::connect("http://localhost:50051").await?;
+    let producer_config = ProducerConfig {
+        topic: "events".to_string(),
+        partition: 0,
+        partitioning: "fixed".to_string(),
+        num_partitions: 1,
+        required_acks: 1,
+        timeout_ms: 5000,
+        batch_size: 100,
+        flush_interval_ms: 100,
+    };
 
     // Producer
-    let producer = Producer::new(client.clone(), producer_config());
+    let producer = Producer::new("http://localhost:50051", producer_config).await?;
     for i in 0..10 {
         producer.send(ProducerMessage {
             key: None,
@@ -213,7 +240,20 @@ async fn main() -> anyhow::Result<()> {
     producer.shutdown().await?;
 
     // Consumer
-    let consumer = Consumer::new(client, consumer_config());
+    let consumer_config = ConsumerConfig {
+        topic: "events".to_string(),
+        partitions: vec![0],
+        group_id: Some("example-group".to_string()),
+        offset: -2,
+        max_bytes: 1_048_576,
+        max_wait_ms: 1000,
+        min_bytes: 1,
+        auto_commit: true,
+        auto_commit_interval_ms: 5000,
+        poll_interval_ms: 1000,
+    };
+
+    let mut consumer = Consumer::new("http://localhost:50051", consumer_config).await?;
     consumer.start(PrintHandler).await?;
 
     tokio::signal::ctrl_c().await?;

@@ -6,15 +6,16 @@
 /// - End-to-end latency
 /// - Different message sizes
 /// - Different batch sizes
-
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use rust_mq::broker::{kafka_broker_server::KafkaBrokerServer, core::BrokerCore, storage::InMemoryStorage};
-use rust_mq::client::{
-    Producer, Consumer, ProducerConfig, ConsumerConfig,
-    ProducerMessage, ConsumedMessage, MessageHandler,
+use rust_mq::broker::{
+    core::BrokerCore, kafka_broker_server::KafkaBrokerServer, storage::InMemoryStorage,
 };
-use std::sync::Arc;
+use rust_mq::client::{
+    ConsumedMessage, Consumer, ConsumerConfig, MessageHandler, Producer, ProducerConfig,
+    ProducerMessage,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::Once;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
@@ -105,10 +106,7 @@ fn bench_producer_throughput(c: &mut Criterion) {
                             flush_interval_ms: 100,
                         };
 
-                        let producer = Producer::new(
-                            BENCH_BROKER_ENDPOINT,
-                            config,
-                        ).await.unwrap();
+                        let producer = Producer::new(BENCH_BROKER_ENDPOINT, config).await.unwrap();
 
                         let message = vec![0u8; size];
                         let msg = ProducerMessage::new(black_box(message));
@@ -150,10 +148,7 @@ fn bench_batch_producer_throughput(c: &mut Criterion) {
                             flush_interval_ms: 1000,
                         };
 
-                        let producer = Producer::new(
-                            BENCH_BROKER_ENDPOINT,
-                            config,
-                        ).await.unwrap();
+                        let producer = Producer::new(BENCH_BROKER_ENDPOINT, config).await.unwrap();
 
                         for _ in 0..size {
                             let message = vec![0u8; 100];
@@ -207,21 +202,21 @@ fn bench_e2e_latency(c: &mut Criterion) {
                 };
 
                 // Create producer
-                let producer = Producer::new(
-                    BENCH_BROKER_ENDPOINT,
-                    producer_config,
-                ).await.unwrap();
+                let producer = Producer::new(BENCH_BROKER_ENDPOINT, producer_config)
+                    .await
+                    .unwrap();
 
                 // Create consumer
                 let counter = Arc::new(AtomicUsize::new(0));
                 let counter_clone = counter.clone();
 
-                let mut consumer = Consumer::new(
-                    BENCH_BROKER_ENDPOINT,
-                    consumer_config,
-                ).await.unwrap();
+                let mut consumer = Consumer::new(BENCH_BROKER_ENDPOINT, consumer_config)
+                    .await
+                    .unwrap();
 
-                let handler = BenchmarkHandler { counter: counter_clone };
+                let handler = BenchmarkHandler {
+                    counter: counter_clone,
+                };
                 consumer.start(handler).await.unwrap();
 
                 // Send and receive message
@@ -268,10 +263,7 @@ fn bench_high_throughput(c: &mut Criterion) {
                     flush_interval_ms: 100,
                 };
 
-                let producer = Producer::new(
-                    BENCH_BROKER_ENDPOINT,
-                    config,
-                ).await.unwrap();
+                let producer = Producer::new(BENCH_BROKER_ENDPOINT, config).await.unwrap();
 
                 for i in 0..message_count {
                     let message = format!("Message {}", i);

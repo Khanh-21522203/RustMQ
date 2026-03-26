@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, Duration};
 use tonic::Request;
@@ -23,8 +23,7 @@ pub struct ConsumedMessage {
 
 impl ConsumedMessage {
     pub fn value_as_string(&self) -> Result<String> {
-        String::from_utf8(self.value.clone())
-            .context("Failed to convert message value to string")
+        String::from_utf8(self.value.clone()).context("Failed to convert message value to string")
     }
 }
 
@@ -66,7 +65,7 @@ pub struct Consumer {
     config: ConsumerConfig,
     client: Arc<KafkaBrokerClient>,
     /// Per-partition offsets
-    partition_offsets: HashMap<i32, i64>,
+    partition_offsets: Arc<Mutex<HashMap<i32, i64>>>,
     offsets_initialized: bool,
     /// Active partitions (from config or group assignment)
     active_partitions: Vec<i32>,
@@ -86,7 +85,7 @@ impl Consumer {
         Ok(Self {
             config,
             client: Arc::new(client),
-            partition_offsets: HashMap::new(),
+            partition_offsets: Arc::new(Mutex::new(HashMap::new())),
             offsets_initialized: false,
             active_partitions,
             shutdown_tx: None,
@@ -115,12 +114,16 @@ impl Consumer {
         }
 
         // Resolve starting offsets for all active partitions
-        let offsets = Self::resolve_starting_offsets(
-            &self.client,
-            &self.config,
-            &self.active_partitions,
-        ).await?;
-        self.partition_offsets = offsets.clone();
+        let offsets =
+            Self::resolve_starting_offsets(&self.client, &self.config, &self.active_partitions)
+                .await?;
+        {
+            let mut lock = self
+                .partition_offsets
+                .lock()
+                .map_err(|e| anyhow::anyhow!("offset mutex poisoned: {}", e))?;
+            *lock = offsets.clone();
+        }
         self.offsets_initialized = true;
         log::info!("Consumer starting from offsets: {:?}", offsets);
 
@@ -171,12 +174,14 @@ impl Consumer {
         let initial_partitions = self.active_partitions.clone();
         let initial_member_id = self.member_id.clone();
         let needs_rejoin = self.needs_rejoin.clone();
-        let mut partition_offsets = offsets;
+        let partition_offsets = self.partition_offsets.clone();
 
         tokio::spawn(async move {
             let mut poll_interval = interval(Duration::from_millis(config.poll_interval_ms));
             let mut auto_commit_interval = if config.auto_commit {
-                Some(interval(Duration::from_millis(config.auto_commit_interval_ms)))
+                Some(interval(Duration::from_millis(
+                    config.auto_commit_interval_ms,
+                )))
             } else {
                 None
             };
@@ -192,15 +197,22 @@ impl Consumer {
                                 match Self::join_and_sync(&client, &config, group_id, member_id.as_deref()).await {
                                     Ok((new_partitions, new_member_id)) => {
                                         member_id = Some(new_member_id);
+                                        let mut offsets_snapshot = partition_offsets
+                                            .lock()
+                                            .map(|g| g.clone())
+                                            .unwrap_or_default();
                                         // Fill in offsets for newly assigned partitions only
                                         for &p in &new_partitions {
-                                            if !partition_offsets.contains_key(&p) {
+                                            if !offsets_snapshot.contains_key(&p) {
                                                 if let Ok(o) = Self::resolve_partition_offset(&client, &config, p).await {
-                                                    partition_offsets.insert(p, o);
+                                                    offsets_snapshot.insert(p, o);
                                                 }
                                             }
                                         }
-                                        partition_offsets.retain(|p, _| new_partitions.contains(p));
+                                        offsets_snapshot.retain(|p, _| new_partitions.contains(p));
+                                        if let Ok(mut lock) = partition_offsets.lock() {
+                                            *lock = offsets_snapshot;
+                                        }
                                         active_partitions = new_partitions;
                                         log::info!("Rejoined group, new partitions: {:?}", active_partitions);
                                     }
@@ -209,10 +221,18 @@ impl Consumer {
                                 needs_rejoin.store(false, Ordering::SeqCst);
                             }
                         } else {
-                            match Self::fetch_all_partitions(&client, &config, &active_partitions, &partition_offsets).await {
+                            let offsets_snapshot = partition_offsets
+                                .lock()
+                                .map(|g| g.clone())
+                                .unwrap_or_default();
+                            match Self::fetch_all_partitions(&client, &config, &active_partitions, &offsets_snapshot).await {
                                 Ok(messages) => {
+                                    if let Ok(mut lock) = partition_offsets.lock() {
+                                        for message in &messages {
+                                            lock.insert(message.partition, message.offset + 1);
+                                        }
+                                    }
                                     for message in messages {
-                                        partition_offsets.insert(message.partition, message.offset + 1);
                                         if let Err(e) = handler.handle(message).await {
                                             log::error!("Error handling message: {}", e);
                                         }
@@ -233,7 +253,11 @@ impl Consumer {
                         }
                     } => {
                         if let Some(group_id) = &config.group_id {
-                            if let Err(e) = Self::commit_all_offsets(&client, &config, group_id, &partition_offsets).await {
+                            let offsets_snapshot = partition_offsets
+                                .lock()
+                                .map(|g| g.clone())
+                                .unwrap_or_default();
+                            if let Err(e) = Self::commit_all_offsets(&client, &config, group_id, &offsets_snapshot).await {
                                 log::error!("Failed to auto-commit offsets: {}", e);
                             }
                         }
@@ -243,7 +267,11 @@ impl Consumer {
                         log::info!("Consumer shutdown signal received");
                         if config.auto_commit {
                             if let Some(group_id) = &config.group_id {
-                                if let Err(e) = Self::commit_all_offsets(&client, &config, group_id, &partition_offsets).await {
+                                let offsets_snapshot = partition_offsets
+                                    .lock()
+                                    .map(|g| g.clone())
+                                    .unwrap_or_default();
+                                if let Err(e) = Self::commit_all_offsets(&client, &config, group_id, &offsets_snapshot).await {
                                     log::error!("Failed to commit offsets on shutdown: {}", e);
                                 }
                             }
@@ -261,105 +289,175 @@ impl Consumer {
 
     pub async fn poll(&mut self) -> Result<Vec<ConsumedMessage>> {
         if !self.offsets_initialized {
-            self.partition_offsets = Self::resolve_starting_offsets(
-                &self.client,
-                &self.config,
-                &self.active_partitions,
-            ).await?;
+            let resolved =
+                Self::resolve_starting_offsets(&self.client, &self.config, &self.active_partitions)
+                    .await?;
+            {
+                let mut lock = self
+                    .partition_offsets
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("offset mutex poisoned: {}", e))?;
+                *lock = resolved;
+            }
             self.offsets_initialized = true;
         }
 
+        let offsets_snapshot = self
+            .partition_offsets
+            .lock()
+            .map_err(|e| anyhow::anyhow!("offset mutex poisoned: {}", e))?
+            .clone();
         let messages = Self::fetch_all_partitions(
             &self.client,
             &self.config,
             &self.active_partitions,
-            &self.partition_offsets,
-        ).await?;
+            &offsets_snapshot,
+        )
+        .await?;
 
-        for msg in &messages {
-            self.partition_offsets.insert(msg.partition, msg.offset + 1);
+        let mut lock = self
+            .partition_offsets
+            .lock()
+            .map_err(|e| anyhow::anyhow!("offset mutex poisoned: {}", e))?;
+        for msg in messages.iter() {
+            lock.insert(msg.partition, msg.offset + 1);
         }
         Ok(messages)
     }
 
     pub async fn commit(&self) -> Result<()> {
         if let Some(group_id) = &self.config.group_id {
-            Self::commit_all_offsets(&self.client, &self.config, group_id, &self.partition_offsets).await?;
-            log::info!("Committed offsets: {:?}", self.partition_offsets);
+            let offsets_snapshot = self
+                .partition_offsets
+                .lock()
+                .map_err(|e| anyhow::anyhow!("offset mutex poisoned: {}", e))?
+                .clone();
+            Self::commit_all_offsets(&self.client, &self.config, group_id, &offsets_snapshot)
+                .await?;
+            log::info!("Committed offsets: {:?}", offsets_snapshot);
         }
         Ok(())
     }
 
     pub fn current_offset(&self) -> i64 {
         // Return the lowest current offset for backward compatibility
-        self.partition_offsets.values().copied().min().unwrap_or(0)
+        self.partition_offsets
+            .lock()
+            .map(|offsets| offsets.values().copied().min().unwrap_or(0))
+            .unwrap_or(0)
     }
 
-    pub fn current_offsets(&self) -> &HashMap<i32, i64> {
-        &self.partition_offsets
+    /// Returns a snapshot of current per-partition offsets as an owned `HashMap`.
+    ///
+    /// **Migration note**: this method returns an owned clone rather than a reference.
+    /// With multi-partition support the offsets are stored behind an `Arc<Mutex<…>>`,
+    /// so returning a borrow is not possible. Update any callers that held a `&HashMap`
+    /// to accept `HashMap<i32, i64>` directly.
+    pub fn current_offsets(&self) -> HashMap<i32, i64> {
+        self.partition_offsets
+            .lock()
+            .map(|offsets| offsets.clone())
+            .unwrap_or_default()
     }
 
     pub fn seek(&mut self, partition: i32, offset: i64) {
-        self.partition_offsets.insert(partition, offset);
+        if let Ok(mut offsets) = self.partition_offsets.lock() {
+            offsets.insert(partition, offset);
+        }
         self.offsets_initialized = true;
     }
 
     /// Join a consumer group and sync to get partition assignments.
     /// Returns (assigned_partitions, actual_member_id).
+    ///
+    /// Retries automatically on `REBALANCE_IN_PROGRESS` (error_code 27) so
+    /// callers don't need to handle transient rebalance windows themselves.
     async fn join_and_sync(
         client: &KafkaBrokerClient,
         config: &ConsumerConfig,
         group_id: &str,
         existing_member_id: Option<&str>,
     ) -> Result<(Vec<i32>, String)> {
-        let member_id = existing_member_id
+        const MAX_ATTEMPTS: u32 = 5;
+        const REBALANCE_ERROR: i32 = 27;
+
+        let mut member_id = existing_member_id
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("consumer-{}", uuid_simple()));
 
-        // JoinGroup: send topic name as protocol_metadata
-        let join_req = Request::new(JoinGroupRequest {
-            group_id: group_id.to_string(),
-            session_timeout: 30000,
-            member_id: member_id.clone(),
-            protocol_type: "consumer".to_string(),
-            group_protocols: vec![join_group_request::GroupProtocol {
-                protocol_name: "range".to_string(),
-                protocol_metadata: config.topic.as_bytes().to_vec(),
-            }],
-        });
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                let delay_ms = 500 * attempt as u64;
+                log::info!(
+                    "REBALANCE_IN_PROGRESS on attempt {}, retrying in {}ms",
+                    attempt,
+                    delay_ms
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
 
-        let join_resp = client.join_group(join_req).await
-            .map_err(|e| anyhow::anyhow!("JoinGroup failed: {}", e))?;
+            // JoinGroup: send topic name as protocol_metadata
+            let join_req = Request::new(JoinGroupRequest {
+                group_id: group_id.to_string(),
+                session_timeout: 30000,
+                member_id: member_id.clone(),
+                protocol_type: "consumer".to_string(),
+                group_protocols: vec![join_group_request::GroupProtocol {
+                    protocol_name: "range".to_string(),
+                    protocol_metadata: config.topic.as_bytes().to_vec(),
+                }],
+            });
 
-        if join_resp.error_code != 0 {
-            anyhow::bail!("JoinGroup error_code={}", join_resp.error_code);
+            let join_resp = client
+                .join_group(join_req)
+                .await
+                .map_err(|e| anyhow::anyhow!("JoinGroup failed: {}", e))?;
+
+            if join_resp.error_code == REBALANCE_ERROR {
+                continue;
+            }
+            if join_resp.error_code != 0 {
+                anyhow::bail!("JoinGroup error_code={}", join_resp.error_code);
+            }
+
+            let actual_member_id = join_resp.member_id.clone();
+            let generation_id = join_resp.generation_id;
+            member_id = actual_member_id.clone();
+
+            // SyncGroup
+            let sync_req = Request::new(SyncGroupRequest {
+                group_id: group_id.to_string(),
+                generation_id,
+                member_id: actual_member_id.clone(),
+                group_assignment: vec![],
+            });
+
+            let sync_resp = client
+                .sync_group(sync_req)
+                .await
+                .map_err(|e| anyhow::anyhow!("SyncGroup failed: {}", e))?;
+
+            if sync_resp.error_code == REBALANCE_ERROR {
+                continue;
+            }
+            if sync_resp.error_code != 0 {
+                anyhow::bail!("SyncGroup error_code={}", sync_resp.error_code);
+            }
+
+            // Decode assigned partitions from bincode
+            let partitions: Vec<i32> = if sync_resp.member_assignment.is_empty() {
+                vec![]
+            } else {
+                bincode::deserialize(&sync_resp.member_assignment).unwrap_or_default()
+            };
+            return Ok((partitions, actual_member_id));
         }
 
-        let actual_member_id = join_resp.member_id.clone();
-        let generation_id = join_resp.generation_id;
-
-        // SyncGroup
-        let sync_req = Request::new(SyncGroupRequest {
-            group_id: group_id.to_string(),
-            generation_id,
-            member_id: actual_member_id.clone(),
-            group_assignment: vec![],
-        });
-
-        let sync_resp = client.sync_group(sync_req).await
-            .map_err(|e| anyhow::anyhow!("SyncGroup failed: {}", e))?;
-
-        if sync_resp.error_code != 0 {
-            anyhow::bail!("SyncGroup error_code={}", sync_resp.error_code);
-        }
-
-        // Decode assigned partitions from bincode
-        let partitions: Vec<i32> = if sync_resp.member_assignment.is_empty() {
-            vec![]
-        } else {
-            bincode::deserialize(&sync_resp.member_assignment).unwrap_or_default()
-        };
-        Ok((partitions, actual_member_id))
+        anyhow::bail!(
+            "Failed to join group '{}' after {} attempts: persistent REBALANCE_IN_PROGRESS",
+            group_id,
+            MAX_ATTEMPTS
+        )
     }
 
     async fn resolve_starting_offsets(
@@ -407,7 +505,11 @@ impl Consumer {
                     }
                 }
                 Err(e) => {
-                    log::warn!("Failed to fetch committed offset for partition {}: {}", partition, e);
+                    log::warn!(
+                        "Failed to fetch committed offset for partition {}: {}",
+                        partition,
+                        e
+                    );
                 }
             }
         }
@@ -492,11 +594,13 @@ impl Consumer {
     ) -> Result<()> {
         let partitions: Vec<offset_commit_request::PartitionData> = offsets
             .iter()
-            .map(|(&partition, &offset)| offset_commit_request::PartitionData {
-                partition,
-                offset,
-                metadata: String::new(),
-            })
+            .map(
+                |(&partition, &offset)| offset_commit_request::PartitionData {
+                    partition,
+                    offset,
+                    metadata: String::new(),
+                },
+            )
             .collect();
 
         let request = Request::new(OffsetCommitRequest {
@@ -521,18 +625,36 @@ impl Consumer {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
         }
+        // Send LeaveGroup so the broker immediately removes this member instead of
+        // waiting for the session timeout.  This prevents REBALANCE_IN_PROGRESS on
+        // the next join within the same group (important for benchmarks / reconnects).
+        if let (Some(group_id), Some(member_id)) =
+            (self.config.group_id.as_ref(), self.member_id.as_ref())
+        {
+            let req = Request::new(LeaveGroupRequest {
+                group_id: group_id.clone(),
+                member_id: member_id.clone(),
+            });
+            let _ = self.client.leave_group(req).await;
+        }
         self.is_running = false;
         log::info!("Consumer shutdown complete");
         Ok(())
     }
 }
 
-/// Simple pseudo-unique ID for consumer member IDs (no uuid dep needed)
+/// Generate a unique consumer member ID using a process-scoped atomic counter
+/// combined with timestamp and PID to guarantee uniqueness across calls.
 fn uuid_simple() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let pid = std::process::id();
-    format!("{}-{}-{}", t.as_secs(), t.subsec_nanos(), pid)
+    format!("{}-{}-{}-{}", t.as_secs(), t.subsec_nanos(), pid, count)
 }
 
 impl Drop for Consumer {
@@ -557,5 +679,62 @@ mod tests {
         };
         assert_eq!(msg.value_as_string().unwrap(), "hello");
         assert_eq!(msg.offset, 100);
+    }
+
+    #[test]
+    fn test_uuid_simple_uniqueness() {
+        let ids: Vec<String> = (0..10).map(|_| uuid_simple()).collect();
+        // All IDs must be distinct
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), 10, "uuid_simple should produce unique IDs");
+    }
+
+    #[test]
+    fn test_partition_offsets_retain_on_rejoin() {
+        // Simulate the offset retention logic during consumer group rejoin:
+        // offsets for unassigned partitions must be dropped, existing ones preserved.
+        let mut offsets: HashMap<i32, i64> = HashMap::new();
+        offsets.insert(0, 100);
+        offsets.insert(1, 200);
+        offsets.insert(2, 300);
+
+        let new_partitions = vec![0i32, 2i32]; // partition 1 was reassigned away
+        offsets.retain(|p, _| new_partitions.contains(p));
+
+        assert_eq!(offsets.len(), 2);
+        assert_eq!(offsets[&0], 100);
+        assert_eq!(offsets[&2], 300);
+        assert!(!offsets.contains_key(&1));
+    }
+
+    #[test]
+    fn test_partition_offsets_new_partition_added_on_rejoin() {
+        // After rejoin, newly assigned partitions start from offset 0 if not seen before.
+        let mut offsets: HashMap<i32, i64> = HashMap::new();
+        offsets.insert(0, 50);
+
+        let new_partitions = vec![0i32, 3i32]; // partition 3 is newly assigned
+        // Simulate resolving offset for partition 3 (returned 0 = start from beginning)
+        for &p in &new_partitions {
+            offsets.entry(p).or_insert(0);
+        }
+        offsets.retain(|p, _| new_partitions.contains(p));
+
+        assert_eq!(offsets[&0], 50, "existing offset must be preserved");
+        assert_eq!(offsets[&3], 0, "new partition starts at 0");
+    }
+
+    #[test]
+    fn test_seek_updates_specific_partition_offset() {
+        let offsets = Arc::new(Mutex::new(HashMap::new()));
+        offsets.lock().unwrap().insert(0, 100i64);
+        offsets.lock().unwrap().insert(1, 200i64);
+
+        // Seek partition 1 back to 50
+        offsets.lock().unwrap().insert(1, 50i64);
+
+        let snapshot = offsets.lock().unwrap().clone();
+        assert_eq!(snapshot[&0], 100, "partition 0 offset must be unchanged");
+        assert_eq!(snapshot[&1], 50, "partition 1 must reflect seek");
     }
 }

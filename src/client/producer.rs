@@ -1,8 +1,8 @@
 use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, Duration};
 use tonic::Request;
@@ -21,11 +21,19 @@ pub struct ProducerMessage {
 
 impl ProducerMessage {
     pub fn new(value: impl Into<Vec<u8>>) -> Self {
-        Self { key: None, value: value.into(), partition: None }
+        Self {
+            key: None,
+            value: value.into(),
+            partition: None,
+        }
     }
 
     pub fn with_key(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
-        Self { key: Some(key.into()), value: value.into(), partition: None }
+        Self {
+            key: Some(key.into()),
+            value: value.into(),
+            partition: None,
+        }
     }
 
     pub fn to_partition(mut self, partition: i32) -> Self {
@@ -49,7 +57,7 @@ pub struct Producer {
     batch: Arc<Mutex<Vec<ProducerMessage>>>,
     shutdown_tx: mpsc::Sender<()>,
     /// Counter for round-robin partition assignment
-    round_robin_counter: Arc<AtomicU32>,
+    round_robin_counter: Arc<AtomicU64>,
 }
 
 impl Producer {
@@ -63,7 +71,7 @@ impl Producer {
         let batch = Arc::new(Mutex::new(Vec::new()));
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-        let round_robin_counter = Arc::new(AtomicU32::new(0));
+        let round_robin_counter = Arc::new(AtomicU64::new(0));
 
         // Start background flush task immediately
         {
@@ -102,7 +110,13 @@ impl Producer {
         }
 
         log::info!("Producer started for topic: {}", config.topic);
-        Ok(Self { config, client, batch, shutdown_tx, round_robin_counter })
+        Ok(Self {
+            config,
+            client,
+            batch,
+            shutdown_tx,
+            round_robin_counter,
+        })
     }
 
     /// Send a single message (adds to batch).
@@ -112,14 +126,20 @@ impl Producer {
         if batch.len() >= self.config.batch_size {
             let messages = std::mem::take(&mut *batch);
             drop(batch);
-            Self::send_batch_inner(&self.client, &self.config, messages, &self.round_robin_counter).await?;
+            Self::send_batch_inner(
+                &self.client,
+                &self.config,
+                messages,
+                &self.round_robin_counter,
+            )
+            .await?;
         }
         Ok(())
     }
 
     /// Send a message synchronously (bypasses batch).
     pub async fn send_sync(&self, message: ProducerMessage) -> Result<ProducerResult> {
-        let partition = message.partition.unwrap_or(self.config.partition);
+        let partition = Self::assign_partition(&message, &self.config, &self.round_robin_counter);
         let request = Request::new(ProduceRequest {
             required_acks: self.config.required_acks,
             timeout_ms: self.config.timeout_ms,
@@ -145,7 +165,10 @@ impl Producer {
                         error_code: 0,
                     });
                 } else {
-                    anyhow::bail!("Failed to send message: error_code={}", partition_result.error_code);
+                    anyhow::bail!(
+                        "Failed to send message: error_code={}",
+                        partition_result.error_code
+                    );
                 }
             }
         }
@@ -156,19 +179,29 @@ impl Producer {
     pub async fn flush(&self) -> Result<()> {
         let messages = std::mem::take(&mut *self.batch.lock().await);
         if !messages.is_empty() {
-            Self::send_batch_inner(&self.client, &self.config, messages, &self.round_robin_counter).await?;
+            Self::send_batch_inner(
+                &self.client,
+                &self.config,
+                messages,
+                &self.round_robin_counter,
+            )
+            .await?;
         }
         Ok(())
     }
 
-    fn assign_partition(msg: &ProducerMessage, config: &ProducerConfig, counter: &Arc<AtomicU32>) -> i32 {
+    fn assign_partition(
+        msg: &ProducerMessage,
+        config: &ProducerConfig,
+        counter: &Arc<AtomicU64>,
+    ) -> i32 {
         if let Some(p) = msg.partition {
             return p;
         }
         match config.partitioning.as_str() {
             "round_robin" => {
                 let next = counter.fetch_add(1, Ordering::Relaxed);
-                (next % config.num_partitions.max(1) as u32) as i32
+                (next % config.num_partitions.max(1) as u64) as i32
             }
             "key_hash" => {
                 if let Some(key) = &msg.key {
@@ -187,14 +220,15 @@ impl Producer {
         client: &KafkaBrokerClient,
         config: &ProducerConfig,
         messages: Vec<ProducerMessage>,
-        counter: &Arc<AtomicU32>,
+        counter: &Arc<AtomicU64>,
     ) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
 
         // Group messages by partition
-        let mut by_partition: std::collections::HashMap<i32, Vec<Record>> = std::collections::HashMap::new();
+        let mut by_partition: std::collections::HashMap<i32, Vec<Record>> =
+            std::collections::HashMap::new();
         for msg in messages {
             let partition = Self::assign_partition(&msg, config, counter);
             by_partition.entry(partition).or_default().push(Record {
@@ -256,6 +290,9 @@ impl Producer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::config::ProducerConfig;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
 
     #[test]
     fn test_producer_message_creation() {
@@ -269,5 +306,88 @@ mod tests {
 
         let msg_with_partition = ProducerMessage::new(b"test").to_partition(1);
         assert_eq!(msg_with_partition.partition, Some(1));
+    }
+
+    #[test]
+    fn test_assign_partition_round_robin() {
+        let config = ProducerConfig {
+            topic: "test".to_string(),
+            partition: 0,
+            partitioning: "round_robin".to_string(),
+            num_partitions: 3,
+            required_acks: 1,
+            timeout_ms: 5000,
+            batch_size: 100,
+            flush_interval_ms: 100,
+        };
+        let counter = Arc::new(AtomicU64::new(0));
+        let msg = ProducerMessage::new(b"v");
+
+        assert_eq!(Producer::assign_partition(&msg, &config, &counter), 0);
+        assert_eq!(Producer::assign_partition(&msg, &config, &counter), 1);
+        assert_eq!(Producer::assign_partition(&msg, &config, &counter), 2);
+        assert_eq!(Producer::assign_partition(&msg, &config, &counter), 0);
+    }
+
+    #[test]
+    fn test_assign_partition_key_hash_is_stable_for_same_key() {
+        let config = ProducerConfig {
+            topic: "test".to_string(),
+            partition: 0,
+            partitioning: "key_hash".to_string(),
+            num_partitions: 8,
+            required_acks: 1,
+            timeout_ms: 5000,
+            batch_size: 100,
+            flush_interval_ms: 100,
+        };
+        let counter = Arc::new(AtomicU64::new(0));
+        let m1 = ProducerMessage::with_key(b"order-42", b"v1");
+        let m2 = ProducerMessage::with_key(b"order-42", b"v2");
+
+        let p1 = Producer::assign_partition(&m1, &config, &counter);
+        let p2 = Producer::assign_partition(&m2, &config, &counter);
+        assert_eq!(p1, p2);
+        assert!(p1 >= 0 && p1 < config.num_partitions);
+    }
+
+    #[test]
+    fn test_assign_partition_round_robin_near_u64_max() {
+        let config = ProducerConfig {
+            topic: "test".to_string(),
+            partition: 0,
+            partitioning: "round_robin".to_string(),
+            num_partitions: 3,
+            required_acks: 1,
+            timeout_ms: 5000,
+            batch_size: 100,
+            flush_interval_ms: 100,
+        };
+        // Start near u64::MAX to verify wrap-around does not panic
+        let counter = Arc::new(AtomicU64::new(u64::MAX - 1));
+        let msg = ProducerMessage::new(b"v");
+        let p1 = Producer::assign_partition(&msg, &config, &counter);
+        let p2 = Producer::assign_partition(&msg, &config, &counter);
+        assert!(p1 >= 0 && p1 < 3);
+        assert!(p2 >= 0 && p2 < 3);
+    }
+
+    #[test]
+    fn test_assign_partition_key_hash_falls_back_to_fixed_without_key() {
+        let config = ProducerConfig {
+            topic: "test".to_string(),
+            partition: 2,
+            partitioning: "key_hash".to_string(),
+            num_partitions: 8,
+            required_acks: 1,
+            timeout_ms: 5000,
+            batch_size: 100,
+            flush_interval_ms: 100,
+        };
+        let counter = Arc::new(AtomicU64::new(0));
+        let msg = ProducerMessage::new(b"no-key"); // no key set
+        let p = Producer::assign_partition(&msg, &config, &counter);
+        // Should fall back to config.partition (2) when no key is present
+        assert_eq!(p, 2);
     }
 }
