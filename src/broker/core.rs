@@ -6,6 +6,15 @@ use crate::broker::rpc_router::BrokerRpcRouter;
 use crate::broker::storage::BrokerStorage;
 use tokio::sync::{mpsc, oneshot};
 
+fn parse_api_addr(addr: &str) -> (String, i32) {
+    if let Some((host, port_str)) = addr.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<i32>() {
+            return (host.to_string(), port);
+        }
+    }
+    (addr.to_string(), 0)
+}
+
 pub struct BrokerCore<S: BrokerStorage> {
     rpc_receive_channel: mpsc::Receiver<(BrokerGrpcRequest, oneshot::Sender<BrokerGrpcResponse>)>,
     storage: S,
@@ -59,6 +68,9 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
             request.topics
         };
 
+        let cluster = self.storage.get_cluster_metadata().await;
+        let replica_ids: Vec<i32> = cluster.brokers.iter().map(|b| b.node_id as i32).collect();
+
         let mut topic_metadata = Vec::new();
         for topic_name in topics {
             if let Some(partitions) = self.storage.get_topic_partitions(&topic_name).await {
@@ -68,9 +80,9 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                         .map(|&partition_id| topic_metadata_response::PartitionMetadata {
                             partition_error_code: 0,
                             partition_id,
-                            leader: 1,
-                            replicas: vec![1],
-                            isr: vec![1],
+                            leader: cluster.leader_id as i32,
+                            replicas: replica_ids.clone(),
+                            isr: replica_ids.clone(),
                         })
                         .collect();
                 topic_metadata.push(topic_metadata_response::TopicMetadata {
@@ -81,13 +93,21 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
             }
         }
 
-        let (broker_id, host, port) = self.storage.get_coordinator_info().await;
+        let brokers: Vec<topic_metadata_response::Broker> = cluster
+            .brokers
+            .iter()
+            .map(|b| {
+                let (host, port) = parse_api_addr(&b.api_addr);
+                topic_metadata_response::Broker {
+                    node_id: b.node_id as i32,
+                    host,
+                    port,
+                }
+            })
+            .collect();
+
         TopicMetadataResponse {
-            brokers: vec![topic_metadata_response::Broker {
-                node_id: broker_id,
-                host,
-                port,
-            }],
+            brokers,
             topics: topic_metadata,
         }
     }
@@ -402,6 +422,42 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
             });
         }
         OffsetCommitResponse { topics }
+    }
+
+    pub(crate) async fn handle_add_node(&self, request: AddNodeRequest) -> AddNodeResponse {
+        match self
+            .storage
+            .add_node(request.node_id, request.api_addr, request.rpc_addr)
+            .await
+        {
+            Ok(_) => AddNodeResponse {
+                error_code: 0,
+                error_message: String::new(),
+            },
+            Err(e) => {
+                log::error!("Failed to add node: {}", e);
+                AddNodeResponse {
+                    error_code: 1,
+                    error_message: e.to_string(),
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn handle_remove_node(&self, request: RemoveNodeRequest) -> RemoveNodeResponse {
+        match self.storage.remove_node(request.node_id).await {
+            Ok(_) => RemoveNodeResponse {
+                error_code: 0,
+                error_message: String::new(),
+            },
+            Err(e) => {
+                log::error!("Failed to remove node: {}", e);
+                RemoveNodeResponse {
+                    error_code: 1,
+                    error_message: e.to_string(),
+                }
+            }
+        }
     }
 
     pub(crate) async fn handle_create_topic(

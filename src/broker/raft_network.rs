@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, Mutex};
 use tonic::{Request, Response, Status};
 // Use prost 0.11 (the version raft uses) to encode/decode eraftpb::Message
@@ -19,7 +19,7 @@ use crate::broker::raft_transport::RaftTransport;
 // ── Peer info ─────────────────────────────────────────────────────────────────
 
 /// Addresses for a single cluster peer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerInfo {
     /// gRPC endpoint for Raft inter-broker messages (must include scheme, e.g. "http://…")
     pub rpc_addr: String,
@@ -35,14 +35,14 @@ pub struct PeerInfo {
 #[derive(Clone)]
 pub struct RaftNetworkSender {
     node_id: u64,
-    /// node_id → peer addresses
-    peers: HashMap<u64, PeerInfo>,
+    /// node_id → peer addresses (shared with RaftStorage for dynamic updates)
+    peers: Arc<RwLock<HashMap<u64, PeerInfo>>>,
     /// Lazy connection pool keyed by node_id
     pool: Arc<Mutex<HashMap<u64, RaftClient<tonic::transport::Channel>>>>,
 }
 
 impl RaftNetworkSender {
-    pub fn new(node_id: u64, peers: HashMap<u64, PeerInfo>) -> Self {
+    pub fn new(node_id: u64, peers: Arc<RwLock<HashMap<u64, PeerInfo>>>) -> Self {
         Self {
             node_id,
             peers,
@@ -51,8 +51,12 @@ impl RaftNetworkSender {
     }
 
     /// Return the API address of a peer node (for leader-redirect hints).
-    pub fn peer_api_addr(&self, node_id: u64) -> Option<&str> {
-        self.peers.get(&node_id).map(|p| p.api_addr.as_str())
+    pub fn peer_api_addr(&self, node_id: u64) -> Option<String> {
+        self.peers
+            .read()
+            .unwrap()
+            .get(&node_id)
+            .map(|p| p.api_addr.clone())
     }
 
     pub async fn send_messages(&self, msgs: Vec<Message>) {
@@ -60,11 +64,16 @@ impl RaftNetworkSender {
             if msg.to == self.node_id {
                 continue; // never send to self
             }
-            let Some(peer) = self.peers.get(&msg.to) else {
-                log::warn!("No address for peer node {}", msg.to);
-                continue;
+            let addr = {
+                let peers = self.peers.read().unwrap();
+                match peers.get(&msg.to) {
+                    Some(p) => p.rpc_addr.clone(),
+                    None => {
+                        log::warn!("No address for peer node {}", msg.to);
+                        continue;
+                    }
+                }
             };
-            let addr = peer.rpc_addr.clone();
 
             let data = RaftProstMessage::encode_to_vec(&msg);
             let request = RaftMessage {
@@ -115,7 +124,7 @@ impl RaftTransport for GrpcTransport {
     }
 
     fn peer_api_addr(&self, node_id: u64) -> Option<String> {
-        self.0.peer_api_addr(node_id).map(str::to_owned)
+        self.0.peer_api_addr(node_id)
     }
 }
 

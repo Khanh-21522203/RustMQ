@@ -22,6 +22,21 @@ pub struct GroupMember {
     pub metadata: Vec<u8>,
 }
 
+/// Metadata about a single broker node as reported to clients.
+pub struct BrokerInfo {
+    pub node_id: u64,
+    /// Client-facing address in "host:port" format.
+    pub api_addr: String,
+}
+
+/// Cluster-wide metadata returned to clients via TopicMetadata responses.
+pub struct ClusterMetadata {
+    /// All known broker nodes.
+    pub brokers: Vec<BrokerInfo>,
+    /// Node ID of the current Raft leader (or this node's ID in single-node mode).
+    pub leader_id: u64,
+}
+
 /// Storage trait defining broker data operations.
 /// All methods take &self — implementations use interior mutability (Arc<RwLock<>>).
 #[async_trait]
@@ -85,6 +100,40 @@ pub trait BrokerStorage: Send + Sync {
         member_id: &str,
     ) -> BrokerResult<()>;
     async fn leave_group(&self, group_id: &str, member_id: &str) -> BrokerResult<()>;
+
+    /// Return cluster-wide metadata (broker list + current leader).
+    /// Default implementation returns a single-node view using `get_coordinator_info`.
+    async fn get_cluster_metadata(&self) -> ClusterMetadata {
+        let (id, host, port) = self.get_coordinator_info().await;
+        ClusterMetadata {
+            brokers: vec![BrokerInfo {
+                node_id: id as u64,
+                api_addr: format!("{}:{}", host, port),
+            }],
+            leader_id: id as u64,
+        }
+    }
+
+    /// Propose adding a new node to the Raft cluster.
+    /// Returns an error in single-node mode.
+    async fn add_node(
+        &self,
+        _node_id: u64,
+        _api_addr: String,
+        _rpc_addr: String,
+    ) -> BrokerResult<()> {
+        Err(BrokerError::Internal(
+            "add_node is only supported in cluster mode".to_string(),
+        ))
+    }
+
+    /// Propose removing a node from the Raft cluster.
+    /// Returns an error in single-node mode.
+    async fn remove_node(&self, _node_id: u64) -> BrokerResult<()> {
+        Err(BrokerError::Internal(
+            "remove_node is only supported in cluster mode".to_string(),
+        ))
+    }
 }
 
 // ── Internal state for InMemoryStorage ───────────────────────────────────────

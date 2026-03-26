@@ -55,6 +55,14 @@ pub trait KafkaBrokerClientTrait {
         &self,
         request: Request<CreateTopicRequest>,
     ) -> Result<CreateTopicResponse, Status>;
+    async fn add_node(
+        &self,
+        request: Request<AddNodeRequest>,
+    ) -> Result<AddNodeResponse, Status>;
+    async fn remove_node(
+        &self,
+        request: Request<RemoveNodeRequest>,
+    ) -> Result<RemoveNodeResponse, Status>;
 }
 
 impl KafkaBrokerClient {
@@ -171,6 +179,24 @@ impl KafkaBrokerClientTrait for KafkaBrokerClient {
     ) -> Result<CreateTopicResponse, Status> {
         let mut client = self.client.lock().await;
         let response = client.create_topic(request).await?;
+        Ok(response.into_inner())
+    }
+
+    async fn add_node(
+        &self,
+        request: Request<AddNodeRequest>,
+    ) -> Result<AddNodeResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.add_node(request).await?;
+        Ok(response.into_inner())
+    }
+
+    async fn remove_node(
+        &self,
+        request: Request<RemoveNodeRequest>,
+    ) -> Result<RemoveNodeResponse, Status> {
+        let mut client = self.client.lock().await;
+        let response = client.remove_node(request).await?;
         Ok(response.into_inner())
     }
 }

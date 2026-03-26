@@ -1,4 +1,4 @@
-use raft::eraftpb::{ConfState, Message};
+use raft::eraftpb::{ConfChange, ConfChangeType, ConfState, EntryType, Message};
 use raft::{storage::MemStorage, Config, RawNode, StateRole};
 use serde::{Deserialize, Serialize};
 use slog::{o, Drain, Logger};
@@ -125,11 +125,15 @@ pub struct RaftNode {
     raw_node: RawNode<MemStorage>,
     data: Arc<RwLock<BrokerData>>,
     propose_rx: mpsc::UnboundedReceiver<(BrokerCommand, oneshot::Sender<anyhow::Result<i64>>)>,
+    conf_change_rx: mpsc::UnboundedReceiver<(ConfChange, oneshot::Sender<anyhow::Result<()>>)>,
     step_rx: mpsc::UnboundedReceiver<Message>,
     network: Box<dyn RaftTransport>,
     is_leader: Arc<AtomicBool>,
     leader_id: Arc<AtomicU64>,
+    /// Shared peer map — updated when ConfChange entries are applied.
+    peers: Arc<std::sync::RwLock<HashMap<u64, PeerInfo>>>,
     pending_replies: HashMap<u64, oneshot::Sender<anyhow::Result<i64>>>,
+    pending_cc_reply: Option<oneshot::Sender<anyhow::Result<()>>>,
     next_proposal_id: u64,
     db: Option<Arc<sled::Db>>,
     #[allow(dead_code)]
@@ -143,20 +147,28 @@ impl RaftNode {
         peers: HashMap<u64, PeerInfo>,
         storage_path: Option<String>,
     ) -> Result<(Self, RaftStorage, RaftGrpcServer), raft::Error> {
+        let peers_arc = Arc::new(std::sync::RwLock::new(peers));
         let (step_tx, step_rx) = mpsc::unbounded_channel();
         let grpc_server = RaftGrpcServer::new(step_tx.clone());
-        let transport = Box::new(GrpcTransport(RaftNetworkSender::new(node_id, peers.clone())));
-        let (node, storage) =
-            Self::new_with_transport(node_id, peers, storage_path, transport, step_tx, step_rx)?;
+        let transport =
+            Box::new(GrpcTransport(RaftNetworkSender::new(node_id, peers_arc.clone())));
+        let (node, storage) = Self::new_with_transport(
+            node_id,
+            peers_arc,
+            storage_path,
+            transport,
+            step_tx,
+            step_rx,
+        )?;
         Ok((node, storage, grpc_server))
     }
 
     /// Create a `RaftNode` with a pre-built transport and step channels.
-    /// The caller owns the channel pair: pass `step_tx` to whichever server will
-    /// forward inbound messages (gRPC or SBE+TCP), and `step_rx` here.
+    /// `peers` must be the same `Arc` that was passed to the transport constructor
+    /// so that dynamic membership updates are reflected in both.
     pub fn new_with_transport(
         node_id: u64,
-        peers: HashMap<u64, PeerInfo>,
+        peers: Arc<std::sync::RwLock<HashMap<u64, PeerInfo>>>,
         storage_path: Option<String>,
         transport: Box<dyn RaftTransport>,
         step_tx: mpsc::UnboundedSender<Message>,
@@ -175,7 +187,7 @@ impl RaftNode {
         };
 
         let mut conf_state = ConfState::default();
-        conf_state.voters = peers.keys().copied().collect();
+        conf_state.voters = peers.read().unwrap().keys().copied().collect();
         let storage = MemStorage::new_with_conf_state(conf_state);
         let raw_node = RawNode::new(&config, storage, &logger)?;
 
@@ -198,6 +210,7 @@ impl RaftNode {
         let is_leader = Arc::new(AtomicBool::new(false));
         let leader_id = Arc::new(AtomicU64::new(0));
         let (propose_tx, propose_rx) = mpsc::unbounded_channel();
+        let (conf_change_tx, conf_change_rx) = mpsc::unbounded_channel();
 
         // step_tx is not used here; the server (gRPC or SBE+TCP) holds it externally.
         drop(step_tx);
@@ -206,11 +219,14 @@ impl RaftNode {
             raw_node,
             data: data.clone(),
             propose_rx,
+            conf_change_rx,
             step_rx,
             network: transport,
             is_leader: is_leader.clone(),
             leader_id: leader_id.clone(),
+            peers: peers.clone(),
             pending_replies: HashMap::new(),
+            pending_cc_reply: None,
             next_proposal_id: 1,
             db,
             logger,
@@ -218,6 +234,7 @@ impl RaftNode {
 
         let raft_storage = RaftStorage {
             propose_tx,
+            conf_change_tx,
             data,
             is_leader,
             leader_id,
@@ -255,6 +272,21 @@ impl RaftNode {
                         Err(e) => {
                             let _ = reply_tx.send(Err(anyhow::anyhow!("serialize: {}", e)));
                         }
+                    }
+                }
+                Some((cc, reply_tx)) = self.conf_change_rx.recv() => {
+                    if self.raw_node.raft.state != StateRole::Leader {
+                        let _ = reply_tx.send(Err(anyhow::anyhow!("not leader")));
+                        continue;
+                    }
+                    // Only one conf change in flight at a time
+                    if self.pending_cc_reply.is_some() {
+                        let _ = reply_tx.send(Err(anyhow::anyhow!("conf change already in progress")));
+                        continue;
+                    }
+                    match self.raw_node.propose_conf_change(vec![], cc) {
+                        Ok(_) => { self.pending_cc_reply = Some(reply_tx); }
+                        Err(e) => { let _ = reply_tx.send(Err(anyhow::anyhow!("{:?}", e))); }
                     }
                 }
                 Some(msg) = self.step_rx.recv() => {
@@ -297,20 +329,22 @@ impl RaftNode {
 
         let committed: Vec<_> = ready.committed_entries().to_vec();
         for entry in committed {
-            if entry.data.is_empty() {
-                continue;
+            if entry.entry_type == EntryType::EntryConfChange as i32 {
+                self.apply_conf_change_entry(&entry.data).await;
+            } else if !entry.data.is_empty() {
+                self.apply_entry_data(&entry.data).await;
             }
-            self.apply_entry_data(&entry.data).await;
         }
 
         let mut light_rd = self.raw_node.advance(ready);
 
         let light_committed: Vec<_> = light_rd.committed_entries().to_vec();
         for entry in light_committed {
-            if entry.data.is_empty() {
-                continue;
+            if entry.entry_type == EntryType::EntryConfChange as i32 {
+                self.apply_conf_change_entry(&entry.data).await;
+            } else if !entry.data.is_empty() {
+                self.apply_entry_data(&entry.data).await;
             }
-            self.apply_entry_data(&entry.data).await;
         }
 
         let light_msgs = light_rd.take_messages();
@@ -325,6 +359,51 @@ impl RaftNode {
             .store(self.raw_node.raft.leader_id, Ordering::SeqCst);
         if was_leader && !is_leader {
             self.fail_pending_replies("leadership changed before commit");
+        }
+    }
+
+    async fn apply_conf_change_entry(&mut self, data: &[u8]) {
+        use prost_raft::Message as ProstRaftMsg;
+
+        let cc = match <ConfChange as ProstRaftMsg>::decode(data) {
+            Ok(cc) => cc,
+            Err(e) => {
+                log::error!("Failed to decode ConfChange: {}", e);
+                // Must still call apply_conf_change to keep raft-rs state consistent
+                if let Some(tx) = self.pending_cc_reply.take() {
+                    let _ = tx.send(Err(anyhow::anyhow!("decode failed: {}", e)));
+                }
+                return;
+            }
+        };
+
+        let cs = match self.raw_node.apply_conf_change(&cc) {
+            Ok(cs) => cs,
+            Err(e) => {
+                log::error!("apply_conf_change failed: {:?}", e);
+                if let Some(tx) = self.pending_cc_reply.take() {
+                    let _ = tx.send(Err(anyhow::anyhow!("{:?}", e)));
+                }
+                return;
+            }
+        };
+
+        // Persist new conf state
+        self.raw_node.raft.raft_log.store.wl().set_conf_state(cs);
+
+        // Update the shared peers map
+        if cc.change_type == ConfChangeType::AddNode as i32 && cc.node_id != 0 {
+            if let Ok(peer_info) = bincode::deserialize::<PeerInfo>(&cc.context) {
+                self.peers.write().unwrap().insert(cc.node_id, peer_info);
+                log::info!("Added node {} to peers map", cc.node_id);
+            }
+        } else if cc.change_type == ConfChangeType::RemoveNode as i32 {
+            self.peers.write().unwrap().remove(&cc.node_id);
+            log::info!("Removed node {} from peers map", cc.node_id);
+        }
+
+        if let Some(tx) = self.pending_cc_reply.take() {
+            let _ = tx.send(Ok(()));
         }
     }
 
@@ -358,7 +437,7 @@ impl RaftNode {
 }
 
 /// Reconstruct BrokerData by scanning all sled keys.
-fn load_broker_data_from_sled(db: &sled::Db) -> BrokerData {
+pub fn load_broker_data_from_sled(db: &sled::Db) -> BrokerData {
     let mut data = BrokerData::default();
 
     for item in db.scan_prefix(b"msg:") {
@@ -456,10 +535,11 @@ fn load_broker_data_from_sled(db: &sled::Db) -> BrokerData {
 #[derive(Clone)]
 pub struct RaftStorage {
     propose_tx: mpsc::UnboundedSender<(BrokerCommand, oneshot::Sender<anyhow::Result<i64>>)>,
+    conf_change_tx: mpsc::UnboundedSender<(ConfChange, oneshot::Sender<anyhow::Result<()>>)>,
     pub data: Arc<RwLock<BrokerData>>,
     is_leader: Arc<AtomicBool>,
     leader_id: Arc<AtomicU64>,
-    peers: HashMap<u64, PeerInfo>,
+    peers: Arc<std::sync::RwLock<HashMap<u64, PeerInfo>>>,
 }
 
 impl RaftStorage {
@@ -472,7 +552,25 @@ impl RaftStorage {
         if lid == 0 {
             return None;
         }
-        self.peers.get(&lid).map(|p| p.api_addr.clone())
+        self.peers
+            .read()
+            .unwrap()
+            .get(&lid)
+            .map(|p| p.api_addr.clone())
+    }
+
+    /// Return a snapshot of all known peers for metadata reporting.
+    pub fn peers_snapshot(&self) -> Vec<(u64, String)> {
+        self.peers
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(&id, p)| (id, p.api_addr.clone()))
+            .collect()
+    }
+
+    pub fn current_leader_id(&self) -> u64 {
+        self.leader_id.load(Ordering::SeqCst)
     }
 
     pub async fn read_data(&self) -> tokio::sync::RwLockReadGuard<'_, BrokerData> {
@@ -602,5 +700,48 @@ impl RaftStorage {
         self.propose(BrokerCommand::GroupFinalize { group_id })
             .await?;
         Ok(())
+    }
+
+    /// Propose adding a new voter node to the Raft cluster.
+    pub async fn propose_add_node(
+        &self,
+        node_id: u64,
+        api_addr: String,
+        rpc_addr: String,
+    ) -> anyhow::Result<()> {
+        let peer_info = PeerInfo {
+            api_addr,
+            rpc_addr,
+            sbe_tcp_addr: None,
+        };
+        let context = bincode::serialize(&peer_info)
+            .map_err(|e| anyhow::anyhow!("serialize PeerInfo: {}", e))?;
+        let cc = ConfChange {
+            change_type: ConfChangeType::AddNode as i32,
+            node_id,
+            context,
+            ..Default::default()
+        };
+        let (tx, rx) = oneshot::channel();
+        self.conf_change_tx
+            .send((cc, tx))
+            .map_err(|e| anyhow::anyhow!("channel closed: {}", e))?;
+        rx.await
+            .map_err(|e| anyhow::anyhow!("reply closed: {}", e))?
+    }
+
+    /// Propose removing a voter node from the Raft cluster.
+    pub async fn propose_remove_node(&self, node_id: u64) -> anyhow::Result<()> {
+        let cc = ConfChange {
+            change_type: ConfChangeType::RemoveNode as i32,
+            node_id,
+            ..Default::default()
+        };
+        let (tx, rx) = oneshot::channel();
+        self.conf_change_tx
+            .send((cc, tx))
+            .map_err(|e| anyhow::anyhow!("channel closed: {}", e))?;
+        rx.await
+            .map_err(|e| anyhow::anyhow!("reply closed: {}", e))?
     }
 }

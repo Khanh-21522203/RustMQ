@@ -451,6 +451,34 @@ pub struct CreateTopicResponse {
     #[prost(string, tag = "2")]
     pub error_message: ::prost::alloc::string::String,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AddNodeRequest {
+    #[prost(uint64, tag = "1")]
+    pub node_id: u64,
+    #[prost(string, tag = "2")]
+    pub api_addr: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub rpc_addr: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AddNodeResponse {
+    #[prost(int32, tag = "1")]
+    pub error_code: i32,
+    #[prost(string, tag = "2")]
+    pub error_message: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RemoveNodeRequest {
+    #[prost(uint64, tag = "1")]
+    pub node_id: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemoveNodeResponse {
+    #[prost(int32, tag = "1")]
+    pub error_code: i32,
+    #[prost(string, tag = "2")]
+    pub error_message: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ErrorCode {
@@ -878,6 +906,49 @@ pub mod broker_client {
             req.extensions_mut().insert(GrpcMethod::new("broker.Broker", "CreateTopic"));
             self.inner.unary(req, path, codec).await
         }
+        /// Cluster Membership (cluster mode only)
+        pub async fn add_node(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AddNodeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AddNodeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/broker.Broker/AddNode");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("broker.Broker", "AddNode"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn remove_node(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RemoveNodeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RemoveNodeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/broker.Broker/RemoveNode");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("broker.Broker", "RemoveNode"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -975,6 +1046,18 @@ pub mod broker_server {
             request: tonic::Request<super::CreateTopicRequest>,
         ) -> std::result::Result<
             tonic::Response<super::CreateTopicResponse>,
+            tonic::Status,
+        >;
+        /// Cluster Membership (cluster mode only)
+        async fn add_node(
+            &self,
+            request: tonic::Request<super::AddNodeRequest>,
+        ) -> std::result::Result<tonic::Response<super::AddNodeResponse>, tonic::Status>;
+        async fn remove_node(
+            &self,
+            request: tonic::Request<super::RemoveNodeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RemoveNodeResponse>,
             tonic::Status,
         >;
     }
@@ -1568,6 +1651,92 @@ pub mod broker_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CreateTopicSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/broker.Broker/AddNode" => {
+                    #[allow(non_camel_case_types)]
+                    struct AddNodeSvc<T: Broker>(pub Arc<T>);
+                    impl<T: Broker> tonic::server::UnaryService<super::AddNodeRequest>
+                    for AddNodeSvc<T> {
+                        type Response = super::AddNodeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AddNodeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Broker>::add_node(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AddNodeSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/broker.Broker/RemoveNode" => {
+                    #[allow(non_camel_case_types)]
+                    struct RemoveNodeSvc<T: Broker>(pub Arc<T>);
+                    impl<T: Broker> tonic::server::UnaryService<super::RemoveNodeRequest>
+                    for RemoveNodeSvc<T> {
+                        type Response = super::RemoveNodeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RemoveNodeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Broker>::remove_node(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RemoveNodeSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

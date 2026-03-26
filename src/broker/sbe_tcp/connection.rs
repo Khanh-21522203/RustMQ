@@ -5,7 +5,7 @@
 //! the next call to `get_or_spawn` reconnects lazily.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -28,13 +28,13 @@ struct PeerConn {
 
 pub struct ConnectionManager {
     node_id: u64,
-    peers: HashMap<u64, PeerInfo>,
+    peers: Arc<RwLock<HashMap<u64, PeerInfo>>>,
     conns: Arc<Mutex<HashMap<u64, PeerConn>>>,
     pool: BufferPool,
 }
 
 impl ConnectionManager {
-    pub fn new(node_id: u64, peers: HashMap<u64, PeerInfo>) -> Self {
+    pub fn new(node_id: u64, peers: Arc<RwLock<HashMap<u64, PeerInfo>>>) -> Self {
         Self {
             node_id,
             peers,
@@ -49,9 +49,15 @@ impl ConnectionManager {
             if msg.to == self.node_id {
                 continue;
             }
-            let Some(peer) = self.peers.get(&msg.to) else {
-                log::warn!("[sbe-tcp] no address for peer {}", msg.to);
-                continue;
+            let tcp_addr = {
+                let peers = self.peers.read().unwrap();
+                match peers.get(&msg.to) {
+                    Some(p) => Self::bare_addr(&p.rpc_addr),
+                    None => {
+                        log::warn!("[sbe-tcp] no address for peer {}", msg.to);
+                        continue;
+                    }
+                }
             };
             // Acquire a pooled buffer, encode into it
             let mut pooled = self.pool.acquire();
@@ -72,7 +78,6 @@ impl ConnectionManager {
             // pooled is dropped here, returning the (now-empty) shell to pool
 
             // Get or spawn a writer task for this peer
-            let tcp_addr = Self::bare_addr(&peer.rpc_addr);
             let tx = self.get_or_spawn(msg.to, tcp_addr).await;
             if let Err(e) = tx.try_send(frame) {
                 log::warn!("[sbe-tcp] send channel full/closed for peer {}: {}", msg.to, e);
@@ -83,7 +88,11 @@ impl ConnectionManager {
     }
 
     pub fn peer_api_addr(&self, node_id: u64) -> Option<String> {
-        self.peers.get(&node_id).map(|p| p.api_addr.clone())
+        self.peers
+            .read()
+            .unwrap()
+            .get(&node_id)
+            .map(|p| p.api_addr.clone())
     }
 
     /// Strip "http://" prefix from rpc_addr (gRPC scheme not needed for raw TCP).

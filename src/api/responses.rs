@@ -1,7 +1,8 @@
 use crate::api::broker::{
-    CreateTopicResponse, FetchResponse, GroupCoordinatorResponse, HeartbeatResponse,
-    JoinGroupResponse, LeaveGroupResponse, ListOffsetsResponse, OffsetCommitResponse,
-    OffsetFetchResponse, ProduceResponse, SyncGroupResponse, TopicMetadataResponse,
+    AddNodeResponse, CreateTopicResponse, FetchResponse, GroupCoordinatorResponse,
+    HeartbeatResponse, JoinGroupResponse, LeaveGroupResponse, ListOffsetsResponse,
+    OffsetCommitResponse, OffsetFetchResponse, ProduceResponse, RemoveNodeResponse,
+    SyncGroupResponse, TopicMetadataResponse,
 };
 
 pub enum BrokerGrpcResponse {
@@ -26,4 +27,8 @@ pub enum BrokerGrpcResponse {
     // Offset Management
     CommitOffset(OffsetCommitResponse),
     FetchOffset(OffsetFetchResponse),
+
+    // Cluster Membership
+    AddNode(AddNodeResponse),
+    RemoveNode(RemoveNodeResponse),
 }

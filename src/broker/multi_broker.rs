@@ -12,7 +12,9 @@ use crate::broker::raft::{GroupStatus, RaftNode, RaftStorage};
 use crate::broker::raft_network::{PeerInfo, RaftGrpcServer};
 use crate::broker::sbe_tcp::server::SbeTcpServer;
 use crate::broker::sbe_tcp::transport::SbeTcpTransport;
-use crate::broker::storage::{validate_topic_name, BrokerStorage, GroupMember, StoredMessage};
+use crate::broker::storage::{
+    validate_topic_name, BrokerInfo, BrokerStorage, ClusterMetadata, GroupMember, StoredMessage,
+};
 use crate::client::kafka_broker_client::{KafkaBrokerClient, KafkaBrokerClientTrait};
 
 /// Abstraction over gRPC or SBE+TCP Raft server.
@@ -68,10 +70,11 @@ impl MultiBroker {
         if transport_kind == "sbe_tcp" {
             let (step_tx, step_rx) = mpsc::unbounded_channel();
             let sbe_server = SbeTcpServer::new(step_tx.clone());
-            let transport = SbeTcpTransport::new(node_id, peers.clone());
+            let peers_arc = std::sync::Arc::new(std::sync::RwLock::new(peers));
+            let transport = SbeTcpTransport::new(node_id, peers_arc.clone());
             let (node, storage) = RaftNode::new_with_transport(
                 node_id,
-                peers,
+                peers_arc,
                 storage_path,
                 Box::new(transport),
                 step_tx,
@@ -500,6 +503,35 @@ impl BrokerStorage for MultiBroker {
             return Err(BrokerError::RebalanceInProgress);
         }
         Ok(())
+    }
+
+    async fn get_cluster_metadata(&self) -> ClusterMetadata {
+        let peers = self.raft_storage.peers_snapshot();
+        let leader_id = self.raft_storage.current_leader_id();
+        let brokers = peers
+            .into_iter()
+            .map(|(id, api_addr)| BrokerInfo { node_id: id, api_addr })
+            .collect();
+        ClusterMetadata { brokers, leader_id }
+    }
+
+    async fn add_node(
+        &self,
+        node_id: u64,
+        api_addr: String,
+        rpc_addr: String,
+    ) -> BrokerResult<()> {
+        self.raft_storage
+            .propose_add_node(node_id, api_addr, rpc_addr)
+            .await
+            .map_err(BrokerError::from)
+    }
+
+    async fn remove_node(&self, node_id: u64) -> BrokerResult<()> {
+        self.raft_storage
+            .propose_remove_node(node_id)
+            .await
+            .map_err(BrokerError::from)
     }
 
     async fn leave_group(&self, group_id: &str, member_id: &str) -> BrokerResult<()> {

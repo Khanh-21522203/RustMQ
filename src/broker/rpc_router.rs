@@ -50,6 +50,12 @@ impl<'a, S: BrokerStorage + 'static> BrokerRpcRouter<'a, S> {
             BrokerGrpcRequest::CreateTopic(req) => {
                 BrokerGrpcResponse::CreateTopic(self.core.handle_create_topic(req).await)
             }
+            BrokerGrpcRequest::AddNode(req) => {
+                BrokerGrpcResponse::AddNode(self.core.handle_add_node(req).await)
+            }
+            BrokerGrpcRequest::RemoveNode(req) => {
+                BrokerGrpcResponse::RemoveNode(self.core.handle_remove_node(req).await)
+            }
         }
     }
 }

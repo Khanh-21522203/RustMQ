@@ -27,6 +27,10 @@ service Broker {
 
   // Topic Management
   rpc CreateTopic(CreateTopicRequest) returns (CreateTopicResponse);
+
+  // Cluster Membership (cluster mode only)
+  rpc AddNode(AddNodeRequest) returns (AddNodeResponse);
+  rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
 }
 
 // ==================== RECORDS ====================
@@ -330,6 +334,28 @@ message CreateTopicRequest {
 }
 
 message CreateTopicResponse {
+  int32 error_code = 1;
+  string error_message = 2;
+}
+
+// ==================== CLUSTER MEMBERSHIP ====================
+
+message AddNodeRequest {
+  uint64 node_id = 1;
+  string api_addr = 2;
+  string rpc_addr = 3;
+}
+
+message AddNodeResponse {
+  int32 error_code = 1;
+  string error_message = 2;
+}
+
+message RemoveNodeRequest {
+  uint64 node_id = 1;
+}
+
+message RemoveNodeResponse {
   int32 error_code = 1;
   string error_message = 2;
 }

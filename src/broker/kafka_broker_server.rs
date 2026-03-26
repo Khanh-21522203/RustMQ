@@ -137,4 +137,18 @@ impl broker_server::Broker for KafkaBrokerServer {
     ) -> Result<Response<CreateTopicResponse>, Status> {
         dispatch!(self, CreateTopic, request)
     }
+
+    async fn add_node(
+        &self,
+        request: Request<AddNodeRequest>,
+    ) -> Result<Response<AddNodeResponse>, Status> {
+        dispatch!(self, AddNode, request)
+    }
+
+    async fn remove_node(
+        &self,
+        request: Request<RemoveNodeRequest>,
+    ) -> Result<Response<RemoveNodeResponse>, Status> {
+        dispatch!(self, RemoveNode, request)
+    }
 }

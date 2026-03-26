@@ -1,7 +1,7 @@
 use crate::api::broker::{
-    CreateTopicRequest, FetchRequest, GroupCoordinatorRequest, HeartbeatRequest, JoinGroupRequest,
-    LeaveGroupRequest, ListOffsetsRequest, OffsetCommitRequest, OffsetFetchRequest, ProduceRequest,
-    SyncGroupRequest, TopicMetadataRequest,
+    AddNodeRequest, CreateTopicRequest, FetchRequest, GroupCoordinatorRequest, HeartbeatRequest,
+    JoinGroupRequest, LeaveGroupRequest, ListOffsetsRequest, OffsetCommitRequest,
+    OffsetFetchRequest, ProduceRequest, RemoveNodeRequest, SyncGroupRequest, TopicMetadataRequest,
 };
 pub enum BrokerGrpcRequest {
     // Topic Management
@@ -25,4 +25,8 @@ pub enum BrokerGrpcRequest {
     // Offset Management
     CommitOffset(OffsetCommitRequest),
     FetchOffset(OffsetFetchRequest),
+
+    // Cluster Membership
+    AddNode(AddNodeRequest),
+    RemoveNode(RemoveNodeRequest),
 }

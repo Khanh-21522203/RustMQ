@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use raft::eraftpb::Message;
 
@@ -16,7 +16,7 @@ pub struct SbeTcpTransport {
 }
 
 impl SbeTcpTransport {
-    pub fn new(node_id: u64, peers: HashMap<u64, PeerInfo>) -> Self {
+    pub fn new(node_id: u64, peers: Arc<RwLock<HashMap<u64, PeerInfo>>>) -> Self {
         Self {
             manager: Arc::new(ConnectionManager::new(node_id, peers)),
         }

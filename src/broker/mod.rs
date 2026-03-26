@@ -9,5 +9,6 @@ pub mod raft_network;
 pub mod raft_transport;
 pub mod sbe_tcp;
 pub mod rpc_router;
+pub mod sled_storage;
 pub mod state_machine;
 pub mod storage;

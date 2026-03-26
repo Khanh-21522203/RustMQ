@@ -39,6 +39,15 @@ pub struct BrokerConfig {
     /// Inter-broker Raft transport: "grpc" (default) or "sbe_tcp"
     #[serde(default = "default_transport")]
     pub transport: String,
+
+    /// Use sled-backed durable storage in single-node mode (default: false = in-memory)
+    #[serde(default)]
+    pub durable: bool,
+
+    /// Address of an existing cluster node to join (enables dynamic membership).
+    /// When set, this node sends an AddNode RPC to that address after startup.
+    #[serde(default)]
+    pub join_addr: Option<String>,
 }
 
 /// Cluster configuration
@@ -157,6 +166,8 @@ impl BrokerConfig {
             retention: RetentionConfig::default(),
             log_level: default_log_level(),
             transport: default_transport(),
+            durable: false,
+            join_addr: None,
         }
     }
 
