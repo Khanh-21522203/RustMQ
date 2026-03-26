@@ -14,6 +14,8 @@ use raft_proto::raft_client::RaftClient;
 use raft_proto::raft_server::Raft;
 use raft_proto::{RaftMessage, RaftReply};
 
+use crate::broker::raft_transport::RaftTransport;
+
 // ── Peer info ─────────────────────────────────────────────────────────────────
 
 /// Addresses for a single cluster peer.
@@ -23,6 +25,8 @@ pub struct PeerInfo {
     pub rpc_addr: String,
     /// gRPC endpoint for client-facing API (e.g. "127.0.0.1:9092")
     pub api_addr: String,
+    /// Raw TCP address for SBE+TCP transport (e.g. "host:29092"). None = unused.
+    pub sbe_tcp_addr: Option<String>,
 }
 
 // ── Outbound: send Raft messages to peers ─────────────────────────────────────
@@ -96,6 +100,22 @@ impl RaftNetworkSender {
         let client = RaftClient::new(channel);
         pool.insert(node_id, client.clone());
         Ok(client)
+    }
+}
+
+// ── GrpcTransport: implements RaftTransport over the existing gRPC sender ─────
+
+/// Wraps `RaftNetworkSender` to satisfy the `RaftTransport` trait.
+pub struct GrpcTransport(pub RaftNetworkSender);
+
+#[async_trait::async_trait]
+impl RaftTransport for GrpcTransport {
+    async fn send_messages(&self, msgs: Vec<Message>) {
+        self.0.send_messages(msgs).await;
+    }
+
+    fn peer_api_addr(&self, node_id: u64) -> Option<String> {
+        self.0.peer_api_addr(node_id).map(str::to_owned)
     }
 }
 

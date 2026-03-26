@@ -6,6 +6,8 @@ pub mod kafka_broker_server;
 pub mod multi_broker;
 pub mod raft;
 pub mod raft_network;
+pub mod raft_transport;
+pub mod sbe_tcp;
 pub mod rpc_router;
 pub mod state_machine;
 pub mod storage;

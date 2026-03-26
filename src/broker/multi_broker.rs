@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tonic::Request;
 
 use crate::api::broker::HeartbeatRequest;
@@ -10,8 +10,25 @@ use crate::broker::config::{RaftConfig, RetentionConfig};
 use crate::broker::error::{BrokerError, BrokerResult};
 use crate::broker::raft::{GroupStatus, RaftNode, RaftStorage};
 use crate::broker::raft_network::{PeerInfo, RaftGrpcServer};
+use crate::broker::sbe_tcp::server::SbeTcpServer;
+use crate::broker::sbe_tcp::transport::SbeTcpTransport;
 use crate::broker::storage::{validate_topic_name, BrokerStorage, GroupMember, StoredMessage};
 use crate::client::kafka_broker_client::{KafkaBrokerClient, KafkaBrokerClientTrait};
+
+/// Abstraction over gRPC or SBE+TCP Raft server.
+pub enum RaftServerHandle {
+    Grpc(RaftGrpcServer),
+    SbeTcp(SbeTcpServer),
+}
+
+impl RaftServerHandle {
+    pub async fn serve(self, addr: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Grpc(s) => s.serve(addr).await,
+            Self::SbeTcp(s) => s.serve(addr).await,
+        }
+    }
+}
 
 /// Local (non-replicated) heartbeat timestamps: (group_id, member_id) → last_heartbeat_ms
 struct LocalState {
@@ -35,16 +52,43 @@ fn now_ms() -> i64 {
 }
 
 impl MultiBroker {
-    pub fn new(
+    pub async fn new(
         node_id: u64,
         peers: HashMap<u64, PeerInfo>,
         storage_path: Option<String>,
         retention: Option<RetentionConfig>,
         raft_config: Option<RaftConfig>,
-    ) -> Result<(Self, RaftGrpcServer), String> {
-        let (raft_node, raft_storage, raft_grpc_server) =
-            RaftNode::new(node_id, peers, storage_path)
+        transport_kind: &str,
+    ) -> Result<(Self, RaftServerHandle), String> {
+
+        let server_handle: RaftServerHandle;
+        let raft_node;
+        let raft_storage;
+
+        if transport_kind == "sbe_tcp" {
+            let (step_tx, step_rx) = mpsc::unbounded_channel();
+            let sbe_server = SbeTcpServer::new(step_tx.clone());
+            let transport = SbeTcpTransport::new(node_id, peers.clone());
+            let (node, storage) = RaftNode::new_with_transport(
+                node_id,
+                peers,
+                storage_path,
+                Box::new(transport),
+                step_tx,
+                step_rx,
+            )
+            .map_err(|e| format!("Failed to create raft node: {:?}", e))?;
+            raft_node = node;
+            raft_storage = storage;
+            server_handle = RaftServerHandle::SbeTcp(sbe_server);
+        } else {
+            // Default: gRPC
+            let (node, storage, grpc_server) = RaftNode::new(node_id, peers, storage_path)
                 .map_err(|e| format!("Failed to create raft node: {:?}", e))?;
+            raft_node = node;
+            raft_storage = storage;
+            server_handle = RaftServerHandle::Grpc(grpc_server);
+        }
 
         tokio::spawn(raft_node.run());
 
@@ -173,7 +217,7 @@ impl MultiBroker {
             broker_port: 9092 + node_id as i32,
         };
 
-        Ok((broker, raft_grpc_server))
+        Ok((broker, server_handle))
     }
 
     async fn forward_heartbeat_to_leader(

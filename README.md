@@ -4,17 +4,19 @@ A Kafka-like message queue system written in Rust with both CLI and library supp
 
 ## Features
 
-- **Multiple Modes**: Run as broker, producer, or consumer  
-- **Multi-Broker Support**: Distributed cluster with Raft consensus 
-- **High Availability**: Automatic leader election and failover  
-- **High Performance**: 800K+ msg/s throughput, <10ms latency  
-- **YAML Configuration**: Easy configuration management  
-- **Reusable Library**: Use as a library in your Rust projects  
-- **CLI Support**: Run as standalone tools  
-- **Graceful Shutdown**: Proper SIGINT/SIGTERM handling  
-- **Batch Processing**: Automatic message batching (2M+ msg/s with large batches)  
-- **Auto-commit**: Automatic offset management  
-- **Consumer Groups**: Offset tracking and load balancing  
+- **Multiple Modes**: Run as broker, producer, or consumer
+- **Multi-Broker Support**: Distributed cluster with Raft consensus
+- **High Availability**: Automatic leader election and failover
+- **High Performance**: 800K+ msg/s throughput, <10ms latency
+- **Pluggable Raft Transport**: gRPC (default) or SBE+TCP (5.4× faster)
+- **Zero-Allocation Codec**: Hand-rolled SBE encoding + lock-free buffer pool on the SBE+TCP path
+- **YAML Configuration**: Easy configuration management
+- **Reusable Library**: Use as a library in your Rust projects
+- **CLI Support**: Run as standalone tools
+- **Graceful Shutdown**: Proper SIGINT/SIGTERM handling
+- **Batch Processing**: Automatic message batching (2M+ msg/s with large batches)
+- **Auto-commit**: Automatic offset management
+- **Consumer Groups**: Offset tracking and load balancing
 - **SOLID Architecture**: Clean, maintainable codebase
 
 ## Architecture
@@ -315,21 +317,43 @@ Step 4: Sending messages...
 ```
 Rust-MQ/
 ├── src/
-│   ├── main.rs                 # CLI entry point
-│   ├── lib.rs                  # Library entry point
-│   ├── api/                    # Protobuf definitions
-│   ├── broker/                 # Broker implementation
-│   │   ├── core.rs            # Broker logic
-│   │   ├── storage.rs         # Storage layer
-│   │   └── kafka_broker_server.rs  # gRPC server
-│   └── client/                 # Client library
-│       ├── config.rs          # Configuration
-│       ├── producer.rs        # Producer implementation
-│       ├── consumer.rs        # Consumer implementation
-│       └── kafka_broker_client.rs  # gRPC client
-├── config/                     # Example configurations
-├── examples/                   # Usage examples
-└── docs/                       # Documentation
+│   ├── main.rs                     # CLI entry point
+│   ├── lib.rs                      # Library entry point
+│   ├── api/                        # Protobuf definitions
+│   ├── broker/                     # Broker implementation
+│   │   ├── core.rs                # Broker logic
+│   │   ├── storage.rs             # Storage layer
+│   │   ├── raft_transport.rs      # RaftTransport trait
+│   │   └── sbe_tcp/               # SBE + TCP transport
+│   │       ├── codec.rs           # Hand-rolled SBE encoder/decoder
+│   │       ├── pool.rs            # Lock-free buffer pool
+│   │       ├── connection.rs      # Persistent TCP connection manager
+│   │       ├── server.rs          # TCP inbound server
+│   │       └── transport.rs       # RaftTransport impl
+│   └── client/                     # Client library
+│       ├── config.rs              # Configuration
+│       ├── producer.rs            # Producer implementation
+│       ├── consumer.rs            # Consumer implementation
+│       └── kafka_broker_client.rs # gRPC client
+├── config/
+│   ├── docker/                     # gRPC cluster configs
+│   └── docker/sbe-tcp/             # SBE+TCP cluster configs
+├── docker-compose.yml              # gRPC cluster
+├── docker-compose-sbe-tcp.yml      # SBE+TCP cluster
+├── examples/                       # Usage examples
+└── docs/                           # Documentation
+```
+
+### Raft Transport Configuration
+
+Add `transport` to your broker YAML to switch inter-broker communication:
+
+```yaml
+# gRPC (default — works out of the box, no extra config needed)
+transport: "grpc"
+
+# SBE + TCP (recommended for production — 5.4× faster than gRPC)
+transport: "sbe_tcp"
 ```
 ## Testing
 
@@ -404,31 +428,36 @@ cargo run --release --example benchmark
 cargo bench
 ```
 
-### Docker Compose Benchmark (3-node Raft)
+### Docker Compose Benchmark (3-node Raft cluster)
+
+Three transport backends are supported. Use the matching compose file for each:
 
 ```bash
-# 1) Start cluster
-docker compose up -d --build
+BENCH='N=50000; START=$(date +%s%3N); seq 1 "$N" | sed "s/^/bench-msg-/" \
+  | rust-mq --mode producer --config /app/config/producer.yaml --broker http://broker-1:9092 \
+    >/tmp/bench.stdout 2>/tmp/bench.stderr; RC=$?; END=$(date +%s%3N); DUR_MS=$((END-START)); \
+  THR=$(awk -v n="$N" -v d="$DUR_MS" "BEGIN{printf \"%.2f\",(n*1000.0)/d}"); \
+  echo "RC=$RC N=$N DUR_MS=$DUR_MS THROUGHPUT_MSG_PER_SEC=$THR"'
 
-# 2) Run producer throughput benchmark from broker-1 container
-docker compose exec -T broker-1 sh -lc '
-  N=50000
-  START=$(date +%s%3N)
-  seq 1 "$N" | sed "s/^/bench-msg-/" \
-    | rust-mq --mode producer --config /app/config/producer.yaml --broker http://broker-1:9092 \
-      >/tmp/bench.stdout 2>/tmp/bench.stderr
-  RC=$?
-  END=$(date +%s%3N)
-  DUR_MS=$((END-START))
-  THR=$(awk -v n="$N" -v d="$DUR_MS" "BEGIN { if (d>0) printf \"%.2f\", (n*1000.0)/d; else print \"inf\" }")
-  echo "RC=$RC N=$N DUR_MS=$DUR_MS THROUGHPUT_MSG_PER_SEC=$THR"
-'
+# gRPC (default)
+docker compose up -d --build
+docker compose exec -T broker-1 sh -lc "$BENCH"
+docker compose down -v
+
+# SBE + TCP
+docker compose -f docker-compose-sbe-tcp.yml up -d --build
+docker compose -f docker-compose-sbe-tcp.yml exec -T broker-1 sh -lc "$BENCH"
+docker compose -f docker-compose-sbe-tcp.yml down -v
 ```
 
-Sample run (March 26, 2026):
-- `RC=0 N=50000 DUR_MS=22419 THROUGHPUT_MSG_PER_SEC=2230.25`
-- No broker warnings/errors during the benchmark window.
-- A few `dns error` Raft warnings right after startup are expected transient logs before all peers are up.
+#### Results (March 26, 2026 — Docker bridge network, 50 000 messages, batch_size=100)
+
+| Transport | Duration | Throughput | vs gRPC | Errors |
+|-----------|----------|------------|---------|--------|
+| gRPC (default) | 20 017 ms | **2 497 msg/s** | 1× | 0 |
+| SBE + TCP | 3 719 ms | **13 444 msg/s** | **5.4×** | 0 |
+
+**SBE + TCP** eliminates HTTP/2 framing and Protobuf encoding from the Raft inter-broker path, replacing them with a hand-rolled SBE codec and a lock-free buffer pool — **5.4× throughput improvement** with zero message loss.
 
 ## Acknowledgments
 

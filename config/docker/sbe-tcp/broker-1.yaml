@@ -1,0 +1,27 @@
+node_id: 1
+api_addr: "0.0.0.0:9092"
+rpc_addr: "0.0.0.0:19092"
+storage_path: "/data/broker-1"
+transport: "sbe_tcp"
+
+cluster:
+  bootstrap: true
+  initial_members:
+    - node_id: 1
+      api_addr: "broker-1:9092"
+      rpc_addr: "broker-1:19092"
+    - node_id: 2
+      api_addr: "broker-2:9092"
+      rpc_addr: "broker-2:19092"
+    - node_id: 3
+      api_addr: "broker-3:9092"
+      rpc_addr: "broker-3:19092"
+
+raft:
+  heartbeat_interval_ms: 500
+  election_timeout_min_ms: 1500
+  election_timeout_max_ms: 3000
+  snapshot_threshold: 10000
+  rebalance_timeout_ms: 30000
+
+log_level: "info"

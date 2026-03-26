@@ -1,0 +1,146 @@
+//! Per-peer persistent TCP connection with a pooled send buffer.
+//!
+//! One writer task per peer owns the TCP stream. The `ConnectionManager`
+//! talks to it over a bounded `mpsc` channel.  On failure the task exits;
+//! the next call to `get_or_spawn` reconnects lazily.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::BytesMut;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, Mutex};
+
+use super::codec;
+use super::pool::BufferPool;
+use crate::broker::raft_network::PeerInfo;
+
+/// A framed buffer ready to write on the wire: 4-byte LE length + SBE payload.
+struct Frame {
+    data: BytesMut,
+}
+
+struct PeerConn {
+    tx: mpsc::Sender<Frame>,
+}
+
+pub struct ConnectionManager {
+    node_id: u64,
+    peers: HashMap<u64, PeerInfo>,
+    conns: Arc<Mutex<HashMap<u64, PeerConn>>>,
+    pool: BufferPool,
+}
+
+impl ConnectionManager {
+    pub fn new(node_id: u64, peers: HashMap<u64, PeerInfo>) -> Self {
+        Self {
+            node_id,
+            peers,
+            conns: Arc::new(Mutex::new(HashMap::new())),
+            pool: BufferPool::new(),
+        }
+    }
+
+    /// Send a batch of Raft messages to their respective peers.
+    pub async fn send_messages(&self, msgs: Vec<raft::eraftpb::Message>) {
+        for msg in msgs {
+            if msg.to == self.node_id {
+                continue;
+            }
+            let Some(peer) = self.peers.get(&msg.to) else {
+                log::warn!("[sbe-tcp] no address for peer {}", msg.to);
+                continue;
+            };
+            // Acquire a pooled buffer, encode into it
+            let mut pooled = self.pool.acquire();
+            // Reserve 4 bytes for length prefix, fill after encoding
+            pooled.buf.extend_from_slice(&[0u8; 4]);
+            if let Err(e) = codec::encode(&msg, &mut pooled.buf) {
+                log::warn!("[sbe-tcp] encode error for peer {}: {}", msg.to, e);
+                continue;
+            }
+            // Write length prefix (payload = total - 4 prefix bytes)
+            let payload_len = (pooled.buf.len() - 4) as u32;
+            pooled.buf[0..4].copy_from_slice(&payload_len.to_le_bytes());
+
+            // Freeze into Frame
+            let frame = Frame {
+                data: pooled.buf.split(),
+            };
+            // pooled is dropped here, returning the (now-empty) shell to pool
+
+            // Get or spawn a writer task for this peer
+            let tcp_addr = Self::bare_addr(&peer.rpc_addr);
+            let tx = self.get_or_spawn(msg.to, tcp_addr).await;
+            if let Err(e) = tx.try_send(frame) {
+                log::warn!("[sbe-tcp] send channel full/closed for peer {}: {}", msg.to, e);
+                // Drop the connection so next call reconnects
+                self.conns.lock().await.remove(&msg.to);
+            }
+        }
+    }
+
+    pub fn peer_api_addr(&self, node_id: u64) -> Option<String> {
+        self.peers.get(&node_id).map(|p| p.api_addr.clone())
+    }
+
+    /// Strip "http://" prefix from rpc_addr (gRPC scheme not needed for raw TCP).
+    fn bare_addr(addr: &str) -> String {
+        addr.trim_start_matches("http://").to_owned()
+    }
+
+    async fn get_or_spawn(&self, peer_id: u64, addr: String) -> mpsc::Sender<Frame> {
+        let mut conns = self.conns.lock().await;
+        if let Some(conn) = conns.get(&peer_id) {
+            // Check if the task is still alive by testing the channel
+            if !conn.tx.is_closed() {
+                return conn.tx.clone();
+            }
+        }
+        // Spawn a new writer task
+        let (tx, rx) = mpsc::channel::<Frame>(256);
+        tokio::spawn(writer_task(peer_id, addr, rx));
+        conns.insert(peer_id, PeerConn { tx: tx.clone() });
+        tx
+    }
+}
+
+/// Long-running task that owns the TCP stream for one peer.
+async fn writer_task(peer_id: u64, addr: String, mut rx: mpsc::Receiver<Frame>) {
+    loop {
+        // Connect (with retry delay on failure)
+        let stream = match TcpStream::connect(&addr).await {
+            Ok(s) => {
+                log::info!("[sbe-tcp] connected to peer {} at {}", peer_id, addr);
+                s
+            }
+            Err(e) => {
+                log::warn!("[sbe-tcp] connect to peer {} ({}): {}", peer_id, addr, e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        // Disable Nagle — we control framing ourselves
+        let _ = stream.set_nodelay(true);
+        let mut stream = stream;
+
+        // Drain the channel writing frames until the connection fails
+        while let Some(frame) = rx.recv().await {
+            if let Err(e) = stream.write_all(&frame.data).await {
+                log::warn!("[sbe-tcp] write to peer {}: {}", peer_id, e);
+                break; // reconnect outer loop
+            }
+        }
+
+        // Channel closed — task exits cleanly
+        if rx.is_closed() {
+            log::info!("[sbe-tcp] writer task for peer {} exiting", peer_id);
+            return;
+        }
+        // Otherwise the write failed — reconnect
+        log::info!("[sbe-tcp] reconnecting to peer {}", peer_id);
+    }
+}

@@ -9,7 +9,8 @@ use std::sync::{
 };
 use tokio::sync::{mpsc, oneshot, RwLock};
 
-use crate::broker::raft_network::{PeerInfo, RaftGrpcServer, RaftNetworkSender};
+use crate::broker::raft_network::{GrpcTransport, PeerInfo, RaftGrpcServer, RaftNetworkSender};
+use crate::broker::raft_transport::RaftTransport;
 
 // ── Replicated state machine ──────────────────────────────────────────────────
 
@@ -125,7 +126,7 @@ pub struct RaftNode {
     data: Arc<RwLock<BrokerData>>,
     propose_rx: mpsc::UnboundedReceiver<(BrokerCommand, oneshot::Sender<anyhow::Result<i64>>)>,
     step_rx: mpsc::UnboundedReceiver<Message>,
-    network: RaftNetworkSender,
+    network: Box<dyn RaftTransport>,
     is_leader: Arc<AtomicBool>,
     leader_id: Arc<AtomicU64>,
     pending_replies: HashMap<u64, oneshot::Sender<anyhow::Result<i64>>>,
@@ -136,11 +137,31 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
+    /// Convenience constructor using the default gRPC transport.
     pub fn new(
         node_id: u64,
         peers: HashMap<u64, PeerInfo>,
         storage_path: Option<String>,
     ) -> Result<(Self, RaftStorage, RaftGrpcServer), raft::Error> {
+        let (step_tx, step_rx) = mpsc::unbounded_channel();
+        let grpc_server = RaftGrpcServer::new(step_tx.clone());
+        let transport = Box::new(GrpcTransport(RaftNetworkSender::new(node_id, peers.clone())));
+        let (node, storage) =
+            Self::new_with_transport(node_id, peers, storage_path, transport, step_tx, step_rx)?;
+        Ok((node, storage, grpc_server))
+    }
+
+    /// Create a `RaftNode` with a pre-built transport and step channels.
+    /// The caller owns the channel pair: pass `step_tx` to whichever server will
+    /// forward inbound messages (gRPC or SBE+TCP), and `step_rx` here.
+    pub fn new_with_transport(
+        node_id: u64,
+        peers: HashMap<u64, PeerInfo>,
+        storage_path: Option<String>,
+        transport: Box<dyn RaftTransport>,
+        step_tx: mpsc::UnboundedSender<Message>,
+        step_rx: mpsc::UnboundedReceiver<Message>,
+    ) -> Result<(Self, RaftStorage), raft::Error> {
         let decorator = slog_term::TermDecorator::new().build();
         let drain = slog_term::CompactFormat::new(decorator).build().fuse();
         let drain = slog_async::Async::new(drain).build().fuse();
@@ -177,17 +198,16 @@ impl RaftNode {
         let is_leader = Arc::new(AtomicBool::new(false));
         let leader_id = Arc::new(AtomicU64::new(0));
         let (propose_tx, propose_rx) = mpsc::unbounded_channel();
-        let (step_tx, step_rx) = mpsc::unbounded_channel();
 
-        let network = RaftNetworkSender::new(node_id, peers.clone());
-        let raft_grpc_server = RaftGrpcServer::new(step_tx);
+        // step_tx is not used here; the server (gRPC or SBE+TCP) holds it externally.
+        drop(step_tx);
 
         let node = Self {
             raw_node,
             data: data.clone(),
             propose_rx,
             step_rx,
-            network,
+            network: transport,
             is_leader: is_leader.clone(),
             leader_id: leader_id.clone(),
             pending_replies: HashMap::new(),
@@ -204,7 +224,7 @@ impl RaftNode {
             peers,
         };
 
-        Ok((node, raft_storage, raft_grpc_server))
+        Ok((node, raft_storage))
     }
 
     pub async fn run(mut self) {

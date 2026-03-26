@@ -126,27 +126,35 @@ async fn run_broker(args: Args) -> Result<()> {
                         PeerInfo {
                             rpc_addr: format!("http://{}", m.rpc_addr),
                             api_addr: m.api_addr.clone(),
+                            sbe_tcp_addr: m.sbe_tcp_addr.clone(),
                         },
                     )
                 })
                 .collect();
 
             let peer_count = peers.len();
-            let (multi_broker, raft_grpc_server) = MultiBroker::new(
+            let transport_kind = config.transport.clone();
+            let (multi_broker, raft_server) = MultiBroker::new(
                 config.node_id,
                 peers,
                 Some(config.storage_path.clone()),
                 Some(config.retention.clone()),
                 config.raft.clone(),
+                &transport_kind,
             )
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to create multi-broker: {}", e))?;
 
-            log::info!("Multi-broker initialized with {} peers", peer_count);
+            log::info!(
+                "Multi-broker initialized with {} peers (transport={})",
+                peer_count,
+                transport_kind
+            );
 
             let rpc_addr = config.rpc_addr.clone();
             tokio::spawn(async move {
-                if let Err(e) = raft_grpc_server.serve(&rpc_addr).await {
-                    log::error!("Raft RPC server error: {}", e);
+                if let Err(e) = raft_server.serve(&rpc_addr).await {
+                    log::error!("Raft transport server error: {}", e);
                 }
             });
 

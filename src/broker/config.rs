@@ -35,6 +35,10 @@ pub struct BrokerConfig {
     /// Log level
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Inter-broker Raft transport: "grpc" (default) or "sbe_tcp"
+    #[serde(default = "default_transport")]
+    pub transport: String,
 }
 
 /// Cluster configuration
@@ -54,6 +58,10 @@ pub struct ClusterMember {
     pub node_id: u64,
     pub api_addr: String,
     pub rpc_addr: String,
+    /// TCP address for SBE transport (only used when transport = "sbe_tcp")
+    /// Defaults to rpc_addr if absent.
+    #[serde(default)]
+    pub sbe_tcp_addr: Option<String>,
 }
 
 /// Message retention configuration
@@ -83,6 +91,7 @@ pub struct RaftConfig {
     /// How long to wait for all members to rejoin before forcing rebalance finalization (ms)
     #[serde(default = "default_rebalance_timeout_ms")]
     pub rebalance_timeout_ms: i64,
+
 }
 
 impl Default for RaftConfig {
@@ -124,6 +133,10 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_transport() -> String {
+    "grpc".to_string()
+}
+
 impl BrokerConfig {
     /// Load configuration from a YAML file
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
@@ -143,6 +156,7 @@ impl BrokerConfig {
             raft: None,
             retention: RetentionConfig::default(),
             log_level: default_log_level(),
+            transport: default_transport(),
         }
     }
 
