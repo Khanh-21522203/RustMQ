@@ -1,5 +1,5 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM rust:1.82-slim AS builder
+FROM rust:1.88-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler \
@@ -22,4 +22,4 @@ COPY config/ /app/config/
 
 EXPOSE 9092 19092
 
-ENTRYPOINT ["rust-mq", "--mode", "broker"]
+ENTRYPOINT ["rust-mq"]

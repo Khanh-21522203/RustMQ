@@ -713,8 +713,9 @@ mod tests {
         let mut offsets: HashMap<i32, i64> = HashMap::new();
         offsets.insert(0, 50);
 
-        let new_partitions = vec![0i32, 3i32]; // partition 3 is newly assigned
-        // Simulate resolving offset for partition 3 (returned 0 = start from beginning)
+        // Partition 3 is newly assigned.
+        // Simulate resolving offset for partition 3 (returned 0 = start from beginning).
+        let new_partitions = vec![0i32, 3i32];
         for &p in &new_partitions {
             offsets.entry(p).or_insert(0);
         }

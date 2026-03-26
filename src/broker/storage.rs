@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 use crate::broker::config::RetentionConfig;
+use crate::broker::error::{BrokerError, BrokerResult};
 
 /// A single stored message with its offset and timestamp.
 #[derive(Debug, Clone)]
@@ -25,7 +26,7 @@ pub struct GroupMember {
 /// All methods take &self — implementations use interior mutability (Arc<RwLock<>>).
 #[async_trait]
 pub trait BrokerStorage: Send + Sync {
-    async fn create_topic(&self, topic: &str, num_partitions: i32) -> Result<(), String>;
+    async fn create_topic(&self, topic: &str, num_partitions: i32) -> BrokerResult<()>;
     async fn get_topics(&self) -> Vec<String>;
     async fn get_topic_partitions(&self, topic: &str) -> Option<Vec<i32>>;
     async fn produce_message(
@@ -34,20 +35,20 @@ pub trait BrokerStorage: Send + Sync {
         partition: i32,
         key: Option<Vec<u8>>,
         value: Vec<u8>,
-    ) -> Result<i64, String>;
+    ) -> BrokerResult<i64>;
     async fn fetch_messages(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
         max_bytes: i32,
-    ) -> Result<Vec<StoredMessage>, String>;
+    ) -> BrokerResult<Vec<StoredMessage>>;
     async fn get_partition_offset(
         &self,
         topic: &str,
         partition: i32,
         time: i64,
-    ) -> Result<Vec<i64>, String>;
+    ) -> BrokerResult<Vec<i64>>;
     async fn commit_offset(
         &self,
         group: &str,
@@ -55,13 +56,13 @@ pub trait BrokerStorage: Send + Sync {
         partition: i32,
         offset: i64,
         metadata: String,
-    ) -> Result<(), String>;
+    ) -> BrokerResult<()>;
     async fn fetch_offset(
         &self,
         group: &str,
         topic: &str,
         partition: i32,
-    ) -> Result<(i64, String), String>;
+    ) -> BrokerResult<(i64, String)>;
     async fn get_coordinator_info(&self) -> (i32, String, i32);
     async fn join_group(
         &self,
@@ -70,20 +71,20 @@ pub trait BrokerStorage: Send + Sync {
         protocol_type: &str,
         protocol_metadata: &[u8],
         session_timeout_ms: i64,
-    ) -> Result<(i32, String, String, Vec<GroupMember>), String>;
+    ) -> BrokerResult<(i32, String, String, Vec<GroupMember>)>;
     async fn sync_group(
         &self,
         group_id: &str,
         generation_id: i32,
         member_id: &str,
-    ) -> Result<Vec<u8>, String>;
+    ) -> BrokerResult<Vec<u8>>;
     async fn heartbeat(
         &self,
         group_id: &str,
         generation_id: i32,
         member_id: &str,
-    ) -> Result<(), String>;
-    async fn leave_group(&self, group_id: &str, member_id: &str) -> Result<(), String>;
+    ) -> BrokerResult<()>;
+    async fn leave_group(&self, group_id: &str, member_id: &str) -> BrokerResult<()>;
 }
 
 // ── Internal state for InMemoryStorage ───────────────────────────────────────
@@ -263,18 +264,20 @@ impl InMemoryStorage {
 
 /// Validate a topic name. Only alphanumeric characters, '.', '-', and '_' are allowed.
 /// This prevents injection via sled key format, which uses ':' as a field separator.
-pub fn validate_topic_name(topic: &str) -> Result<(), String> {
+pub fn validate_topic_name(topic: &str) -> BrokerResult<()> {
     if topic.is_empty() {
-        return Err("Topic name cannot be empty".to_string());
+        return Err(BrokerError::Validation(
+            "Topic name cannot be empty".to_string(),
+        ));
     }
     if !topic
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
     {
-        return Err(format!(
+        return Err(BrokerError::Validation(format!(
             "Invalid topic name '{}': only alphanumeric characters, '.', '-', and '_' are allowed",
             topic
-        ));
+        )));
     }
     Ok(())
 }
@@ -339,13 +342,20 @@ fn compute_assignments(
 
 #[async_trait]
 impl BrokerStorage for InMemoryStorage {
-    async fn create_topic(&self, topic: &str, num_partitions: i32) -> Result<(), String> {
+    async fn create_topic(&self, topic: &str, num_partitions: i32) -> BrokerResult<()> {
         validate_topic_name(topic)?;
         if num_partitions <= 0 {
-            return Err("num_partitions must be > 0".to_string());
+            return Err(BrokerError::Validation(
+                "num_partitions must be > 0".to_string(),
+            ));
         }
         let mut guard = self.inner.write().await;
-        let InnerStorage { topics, messages, next_offsets, .. } = &mut *guard;
+        let InnerStorage {
+            topics,
+            messages,
+            next_offsets,
+            ..
+        } = &mut *guard;
         topics.insert(topic.to_string(), num_partitions);
         for p in 0..num_partitions {
             messages
@@ -353,9 +363,7 @@ impl BrokerStorage for InMemoryStorage {
                 .or_default()
                 .entry(p)
                 .or_default();
-            next_offsets
-                .entry((topic.to_string(), p))
-                .or_insert(0);
+            next_offsets.entry((topic.to_string(), p)).or_insert(0);
         }
         Ok(())
     }
@@ -379,10 +387,14 @@ impl BrokerStorage for InMemoryStorage {
         partition: i32,
         key: Option<Vec<u8>>,
         value: Vec<u8>,
-    ) -> Result<i64, String> {
+    ) -> BrokerResult<i64> {
         validate_topic_name(topic)?;
         let mut guard = self.inner.write().await;
-        let InnerStorage { messages, next_offsets, .. } = &mut *guard;
+        let InnerStorage {
+            messages,
+            next_offsets,
+            ..
+        } = &mut *guard;
         // Read both values before any mutation to avoid split-borrow conflicts
         let log_last = messages
             .get(topic)
@@ -416,7 +428,7 @@ impl BrokerStorage for InMemoryStorage {
         partition: i32,
         offset: i64,
         max_bytes: i32,
-    ) -> Result<Vec<StoredMessage>, String> {
+    ) -> BrokerResult<Vec<StoredMessage>> {
         let inner = self.inner.read().await;
         let Some(topic_data) = inner.messages.get(topic) else {
             return Ok(vec![]);
@@ -448,7 +460,7 @@ impl BrokerStorage for InMemoryStorage {
         topic: &str,
         partition: i32,
         time: i64,
-    ) -> Result<Vec<i64>, String> {
+    ) -> BrokerResult<Vec<i64>> {
         let inner = self.inner.read().await;
         // Use the high-watermark as the "next offset" so callers see the correct value
         // even when the log has been fully truncated by retention.
@@ -483,7 +495,7 @@ impl BrokerStorage for InMemoryStorage {
         partition: i32,
         offset: i64,
         metadata: String,
-    ) -> Result<(), String> {
+    ) -> BrokerResult<()> {
         let mut inner = self.inner.write().await;
         inner
             .offsets
@@ -500,7 +512,7 @@ impl BrokerStorage for InMemoryStorage {
         group: &str,
         topic: &str,
         partition: i32,
-    ) -> Result<(i64, String), String> {
+    ) -> BrokerResult<(i64, String)> {
         let inner = self.inner.read().await;
         Ok(inner
             .offsets
@@ -522,7 +534,7 @@ impl BrokerStorage for InMemoryStorage {
         _protocol_type: &str,
         protocol_metadata: &[u8],
         session_timeout_ms: i64,
-    ) -> Result<(i32, String, String, Vec<GroupMember>), String> {
+    ) -> BrokerResult<(i32, String, String, Vec<GroupMember>)> {
         let topic = std::str::from_utf8(protocol_metadata)
             .unwrap_or("")
             .to_string();
@@ -610,14 +622,14 @@ impl BrokerStorage for InMemoryStorage {
         group_id: &str,
         _generation_id: i32,
         member_id: &str,
-    ) -> Result<Vec<u8>, String> {
+    ) -> BrokerResult<Vec<u8>> {
         let inner = self.inner.read().await;
         let group = inner
             .groups
             .get(group_id)
-            .ok_or_else(|| "Group not found".to_string())?;
+            .ok_or_else(|| BrokerError::NotFound("Group not found".to_string()))?;
         if group.status == GroupStatus::PreparingRebalance {
-            return Err("REBALANCE_IN_PROGRESS".to_string());
+            return Err(BrokerError::RebalanceInProgress);
         }
         let assigned = group
             .assignments
@@ -632,30 +644,35 @@ impl BrokerStorage for InMemoryStorage {
         group_id: &str,
         _generation_id: i32,
         member_id: &str,
-    ) -> Result<(), String> {
+    ) -> BrokerResult<()> {
         let mut inner = self.inner.write().await;
         let group = inner
             .groups
             .get_mut(group_id)
-            .ok_or_else(|| format!("Unknown group: {}", group_id))?;
+            .ok_or_else(|| BrokerError::NotFound(format!("Unknown group: {}", group_id)))?;
         let member = group
             .members
             .iter_mut()
             .find(|m| m.member_id == member_id)
-            .ok_or_else(|| format!("Unknown member '{}' in group '{}'", member_id, group_id))?;
+            .ok_or_else(|| {
+                BrokerError::NotFound(format!(
+                    "Unknown member '{}' in group '{}'",
+                    member_id, group_id
+                ))
+            })?;
         member.last_heartbeat_ms = now_ms();
         if group.status == GroupStatus::PreparingRebalance {
-            return Err("REBALANCE_IN_PROGRESS".to_string());
+            return Err(BrokerError::RebalanceInProgress);
         }
         Ok(())
     }
 
-    async fn leave_group(&self, group_id: &str, member_id: &str) -> Result<(), String> {
+    async fn leave_group(&self, group_id: &str, member_id: &str) -> BrokerResult<()> {
         let mut inner = self.inner.write().await;
         let group = inner
             .groups
             .get_mut(group_id)
-            .ok_or_else(|| "Group not found".to_string())?;
+            .ok_or_else(|| BrokerError::NotFound("Group not found".to_string()))?;
         group.members.retain(|m| m.member_id != member_id);
         group.subscriptions.remove(member_id);
         group.assignments.remove(member_id);
@@ -783,7 +800,10 @@ mod tests {
         let storage = InMemoryStorage::new(1, "localhost".to_string(), 50051);
         let result = storage.create_topic("bad:topic", 1).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid topic name"));
+        match result.unwrap_err() {
+            BrokerError::Validation(msg) => assert!(msg.contains("Invalid topic name")),
+            other => panic!("expected validation error, got {other}"),
+        }
     }
 
     #[tokio::test]
@@ -853,6 +873,10 @@ mod tests {
             .get_partition_offset(topic, partition, -1)
             .await
             .unwrap();
-        assert_eq!(offsets, vec![5], "latest offset must reflect high-watermark");
+        assert_eq!(
+            offsets,
+            vec![5],
+            "latest offset must reflect high-watermark"
+        );
     }
 }

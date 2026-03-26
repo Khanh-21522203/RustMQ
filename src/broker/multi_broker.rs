@@ -7,6 +7,7 @@ use tonic::Request;
 
 use crate::api::broker::HeartbeatRequest;
 use crate::broker::config::{RaftConfig, RetentionConfig};
+use crate::broker::error::{BrokerError, BrokerResult};
 use crate::broker::raft::{GroupStatus, RaftNode, RaftStorage};
 use crate::broker::raft_network::{PeerInfo, RaftGrpcServer};
 use crate::broker::storage::{validate_topic_name, BrokerStorage, GroupMember, StoredMessage};
@@ -179,44 +180,47 @@ impl MultiBroker {
         &self,
         group_id: &str,
         member_id: &str,
-    ) -> Result<(), String> {
+    ) -> BrokerResult<()> {
         let leader_addr = self
             .raft_storage
             .leader_api_addr()
-            .ok_or_else(|| "NOT_LEADER:".to_string())?;
-        let client = KafkaBrokerClient::new(&leader_addr)
-            .await
-            .map_err(|e| format!("NOT_LEADER:{} ({})", leader_addr, e))?;
+            .ok_or_else(|| BrokerError::NotLeader { leader_addr: None })?;
+        let client =
+            KafkaBrokerClient::new(&leader_addr)
+                .await
+                .map_err(|_| BrokerError::NotLeader {
+                    leader_addr: Some(leader_addr.clone()),
+                })?;
         let req = Request::new(HeartbeatRequest {
             group_id: group_id.to_string(),
             generation_id: 0,
             member_id: member_id.to_string(),
         });
         let resp = client.heartbeat(req).await.map_err(|e| {
-            format!(
+            BrokerError::Internal(format!(
                 "Failed to forward heartbeat to leader {}: {}",
                 leader_addr, e
-            )
+            ))
         })?;
         match resp.error_code {
             0 => Ok(()),
-            27 => Err("REBALANCE_IN_PROGRESS".to_string()),
-            code => Err(format!(
+            27 => Err(BrokerError::RebalanceInProgress),
+            code => Err(BrokerError::Internal(format!(
                 "Heartbeat error_code={} from leader {}",
                 code, leader_addr
-            )),
+            ))),
         }
     }
 }
 
 #[async_trait]
 impl BrokerStorage for MultiBroker {
-    async fn create_topic(&self, topic: &str, num_partitions: i32) -> Result<(), String> {
+    async fn create_topic(&self, topic: &str, num_partitions: i32) -> BrokerResult<()> {
         validate_topic_name(topic)?;
         self.raft_storage
             .propose_create_topic(topic.to_string(), num_partitions)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(BrokerError::from)
     }
 
     async fn get_topics(&self) -> Vec<String> {
@@ -235,12 +239,12 @@ impl BrokerStorage for MultiBroker {
         partition: i32,
         key: Option<Vec<u8>>,
         value: Vec<u8>,
-    ) -> Result<i64, String> {
+    ) -> BrokerResult<i64> {
         validate_topic_name(topic)?;
         self.raft_storage
             .propose_produce(topic.to_string(), partition, key, value)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(BrokerError::from)
     }
 
     async fn fetch_messages(
@@ -249,7 +253,7 @@ impl BrokerStorage for MultiBroker {
         partition: i32,
         offset: i64,
         max_bytes: i32,
-    ) -> Result<Vec<StoredMessage>, String> {
+    ) -> BrokerResult<Vec<StoredMessage>> {
         let data = self.raft_storage.read_data().await;
         let Some(log) = data.messages.get(&(topic.to_owned(), partition)) else {
             return Ok(vec![]);
@@ -281,7 +285,7 @@ impl BrokerStorage for MultiBroker {
         topic: &str,
         partition: i32,
         time: i64,
-    ) -> Result<Vec<i64>, String> {
+    ) -> BrokerResult<Vec<i64>> {
         let data = self.raft_storage.read_data().await;
         let log = data.messages.get(&(topic.to_owned(), partition));
         // Use the high-watermark as the floor for "next offset" so callers see the correct
@@ -312,11 +316,11 @@ impl BrokerStorage for MultiBroker {
         partition: i32,
         offset: i64,
         _metadata: String,
-    ) -> Result<(), String> {
+    ) -> BrokerResult<()> {
         self.raft_storage
             .propose_commit_offset(group.to_string(), topic.to_string(), partition, offset)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(BrokerError::from)
     }
 
     async fn fetch_offset(
@@ -324,7 +328,7 @@ impl BrokerStorage for MultiBroker {
         group: &str,
         topic: &str,
         partition: i32,
-    ) -> Result<(i64, String), String> {
+    ) -> BrokerResult<(i64, String)> {
         let data = self.raft_storage.read_data().await;
         let offset = data
             .offsets
@@ -349,7 +353,7 @@ impl BrokerStorage for MultiBroker {
         _protocol_type: &str,
         protocol_metadata: &[u8],
         session_timeout_ms: i64,
-    ) -> Result<(i32, String, String, Vec<GroupMember>), String> {
+    ) -> BrokerResult<(i32, String, String, Vec<GroupMember>)> {
         let topic = std::str::from_utf8(protocol_metadata)
             .unwrap_or("")
             .to_string();
@@ -371,14 +375,14 @@ impl BrokerStorage for MultiBroker {
                 session_timeout_ms,
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(BrokerError::from)?;
 
         // Read resulting group state
         let data = self.raft_storage.read_data().await;
         let group = data
             .groups
             .get(group_id)
-            .ok_or_else(|| "Group not found after join".to_string())?;
+            .ok_or_else(|| BrokerError::NotFound("Group not found after join".to_string()))?;
         let members: Vec<GroupMember> = group
             .members
             .iter()
@@ -400,14 +404,14 @@ impl BrokerStorage for MultiBroker {
         group_id: &str,
         _generation_id: i32,
         member_id: &str,
-    ) -> Result<Vec<u8>, String> {
+    ) -> BrokerResult<Vec<u8>> {
         let data = self.raft_storage.read_data().await;
         let group = data
             .groups
             .get(group_id)
-            .ok_or_else(|| "Group not found".to_string())?;
+            .ok_or_else(|| BrokerError::NotFound("Group not found".to_string()))?;
         if group.status == GroupStatus::PreparingRebalance {
-            return Err("REBALANCE_IN_PROGRESS".to_string());
+            return Err(BrokerError::RebalanceInProgress);
         }
         let assigned = group
             .assignments
@@ -422,7 +426,7 @@ impl BrokerStorage for MultiBroker {
         group_id: &str,
         _generation_id: i32,
         member_id: &str,
-    ) -> Result<(), String> {
+    ) -> BrokerResult<()> {
         // Followers forward heartbeats to the active leader so leader-side expiry
         // logic always observes the latest member liveness.
         if !self.raft_storage.is_leader() {
@@ -441,20 +445,20 @@ impl BrokerStorage for MultiBroker {
         let group = data
             .groups
             .get(group_id)
-            .ok_or_else(|| format!("Unknown group: {}", group_id))?;
+            .ok_or_else(|| BrokerError::NotFound(format!("Unknown group: {}", group_id)))?;
         if !group.members.iter().any(|m| m.member_id == member_id) {
-            return Err(format!(
+            return Err(BrokerError::NotFound(format!(
                 "Unknown member '{}' in group '{}'",
                 member_id, group_id
-            ));
+            )));
         }
         if group.status == GroupStatus::PreparingRebalance {
-            return Err("REBALANCE_IN_PROGRESS".to_string());
+            return Err(BrokerError::RebalanceInProgress);
         }
         Ok(())
     }
 
-    async fn leave_group(&self, group_id: &str, member_id: &str) -> Result<(), String> {
+    async fn leave_group(&self, group_id: &str, member_id: &str) -> BrokerResult<()> {
         // Remove heartbeat entry
         {
             let mut local = self.local.write().await;
@@ -466,6 +470,6 @@ impl BrokerStorage for MultiBroker {
         self.raft_storage
             .propose_group_leave(group_id.to_string(), member_id.to_string())
             .await
-            .map_err(|e| e.to_string())
+            .map_err(BrokerError::from)
     }
 }

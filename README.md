@@ -404,6 +404,32 @@ cargo run --release --example benchmark
 cargo bench
 ```
 
+### Docker Compose Benchmark (3-node Raft)
+
+```bash
+# 1) Start cluster
+docker compose up -d --build
+
+# 2) Run producer throughput benchmark from broker-1 container
+docker compose exec -T broker-1 sh -lc '
+  N=50000
+  START=$(date +%s%3N)
+  seq 1 "$N" | sed "s/^/bench-msg-/" \
+    | rust-mq --mode producer --config /app/config/producer.yaml --broker http://broker-1:9092 \
+      >/tmp/bench.stdout 2>/tmp/bench.stderr
+  RC=$?
+  END=$(date +%s%3N)
+  DUR_MS=$((END-START))
+  THR=$(awk -v n="$N" -v d="$DUR_MS" "BEGIN { if (d>0) printf \"%.2f\", (n*1000.0)/d; else print \"inf\" }")
+  echo "RC=$RC N=$N DUR_MS=$DUR_MS THROUGHPUT_MSG_PER_SEC=$THR"
+'
+```
+
+Sample run (March 26, 2026):
+- `RC=0 N=50000 DUR_MS=22419 THROUGHPUT_MSG_PER_SEC=2230.25`
+- No broker warnings/errors during the benchmark window.
+- A few `dns error` Raft warnings right after startup are expected transient logs before all peers are up.
+
 ## Acknowledgments
 
 - Inspired by Apache Kafka

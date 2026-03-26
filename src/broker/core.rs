@@ -1,6 +1,8 @@
 use crate::api::broker::*;
 use crate::api::requests::BrokerGrpcRequest;
 use crate::api::responses::BrokerGrpcResponse;
+use crate::broker::error::BrokerError;
+use crate::broker::rpc_router::BrokerRpcRouter;
 use crate::broker::storage::BrokerStorage;
 use tokio::sync::{mpsc, oneshot};
 
@@ -37,53 +39,17 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_rpc(
+    pub(crate) async fn handle_rpc(
         &mut self,
         request: BrokerGrpcRequest,
         response_sender: oneshot::Sender<BrokerGrpcResponse>,
     ) {
-        let response = match request {
-            BrokerGrpcRequest::GetTopicMetadata(req) => {
-                BrokerGrpcResponse::GetTopicMetadata(self.handle_get_topic_metadata(req).await)
-            }
-            BrokerGrpcRequest::Produce(req) => {
-                BrokerGrpcResponse::Produce(self.handle_produce(req).await)
-            }
-            BrokerGrpcRequest::Fetch(req) => {
-                BrokerGrpcResponse::Fetch(self.handle_fetch(req).await)
-            }
-            BrokerGrpcRequest::ListOffsets(req) => {
-                BrokerGrpcResponse::ListOffsets(self.handle_list_offsets(req).await)
-            }
-            BrokerGrpcRequest::FindCoordinator(req) => {
-                BrokerGrpcResponse::FindCoordinator(self.handle_find_coordinator(req).await)
-            }
-            BrokerGrpcRequest::JoinGroup(req) => {
-                BrokerGrpcResponse::JoinGroup(self.handle_join_group(req).await)
-            }
-            BrokerGrpcRequest::SyncGroup(req) => {
-                BrokerGrpcResponse::SyncGroup(self.handle_sync_group(req).await)
-            }
-            BrokerGrpcRequest::Heartbeat(req) => {
-                BrokerGrpcResponse::Heartbeat(self.handle_heartbeat(req).await)
-            }
-            BrokerGrpcRequest::LeaveGroup(req) => {
-                BrokerGrpcResponse::LeaveGroup(self.handle_leave_group(req).await)
-            }
-            BrokerGrpcRequest::CommitOffset(req) => {
-                BrokerGrpcResponse::CommitOffset(self.handle_commit_offset(req).await)
-            }
-            BrokerGrpcRequest::FetchOffset(req) => {
-                BrokerGrpcResponse::FetchOffset(self.handle_fetch_offset(req).await)
-            }
-            BrokerGrpcRequest::CreateTopic(req) => {
-                BrokerGrpcResponse::CreateTopic(self.handle_create_topic(req).await)
-            }
-        };
+        let router = BrokerRpcRouter::new(self);
+        let response = router.dispatch(request).await;
         let _ = response_sender.send(response);
     }
 
-    async fn handle_get_topic_metadata(
+    pub(crate) async fn handle_get_topic_metadata(
         &self,
         request: TopicMetadataRequest,
     ) -> TopicMetadataResponse {
@@ -126,7 +92,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_produce(&self, request: ProduceRequest) -> ProduceResponse {
+    pub(crate) async fn handle_produce(&self, request: ProduceRequest) -> ProduceResponse {
         let mut results = Vec::new();
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
@@ -150,12 +116,14 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                             last_offset = offset;
                         }
                         Err(e) => {
-                            let err_str = e.to_string();
-                            if let Some(addr) = err_str.strip_prefix("NOT_LEADER:") {
+                            if let BrokerError::NotLeader {
+                                leader_addr: Some(addr),
+                            } = e
+                            {
                                 error_code = 6; // NOT_LEADER_FOR_PARTITION
-                                leader_addr = addr.to_string();
+                                leader_addr = addr;
                             } else {
-                                log::error!("Failed to produce message: {}", err_str);
+                                log::error!("Failed to produce message: {}", e);
                                 error_code = 1;
                             }
                         }
@@ -176,7 +144,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         ProduceResponse { results }
     }
 
-    async fn handle_fetch(&self, request: FetchRequest) -> FetchResponse {
+    pub(crate) async fn handle_fetch(&self, request: FetchRequest) -> FetchResponse {
         let mut topics = Vec::new();
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
@@ -229,7 +197,10 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         FetchResponse { topics }
     }
 
-    async fn handle_list_offsets(&self, request: ListOffsetsRequest) -> ListOffsetsResponse {
+    pub(crate) async fn handle_list_offsets(
+        &self,
+        request: ListOffsetsRequest,
+    ) -> ListOffsetsResponse {
         let mut topics = Vec::new();
         for topic_data in request.topics {
             let mut partition_offsets = Vec::new();
@@ -268,7 +239,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         ListOffsetsResponse { topics }
     }
 
-    async fn handle_find_coordinator(
+    pub(crate) async fn handle_find_coordinator(
         &self,
         _request: GroupCoordinatorRequest,
     ) -> GroupCoordinatorResponse {
@@ -282,7 +253,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_join_group(&self, request: JoinGroupRequest) -> JoinGroupResponse {
+    pub(crate) async fn handle_join_group(&self, request: JoinGroupRequest) -> JoinGroupResponse {
         let protocol_metadata = request
             .group_protocols
             .first()
@@ -335,7 +306,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_sync_group(&self, request: SyncGroupRequest) -> SyncGroupResponse {
+    pub(crate) async fn handle_sync_group(&self, request: SyncGroupRequest) -> SyncGroupResponse {
         match self
             .storage
             .sync_group(&request.group_id, request.generation_id, &request.member_id)
@@ -345,7 +316,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                 error_code: 0,
                 member_assignment,
             },
-            Err(e) if e == "REBALANCE_IN_PROGRESS" => SyncGroupResponse {
+            Err(BrokerError::RebalanceInProgress) => SyncGroupResponse {
                 error_code: 27,
                 member_assignment: Vec::new(),
             },
@@ -359,14 +330,14 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_heartbeat(&self, request: HeartbeatRequest) -> HeartbeatResponse {
+    pub(crate) async fn handle_heartbeat(&self, request: HeartbeatRequest) -> HeartbeatResponse {
         match self
             .storage
             .heartbeat(&request.group_id, request.generation_id, &request.member_id)
             .await
         {
             Ok(_) => HeartbeatResponse { error_code: 0 },
-            Err(e) if e == "REBALANCE_IN_PROGRESS" => HeartbeatResponse { error_code: 27 },
+            Err(BrokerError::RebalanceInProgress) => HeartbeatResponse { error_code: 27 },
             Err(e) => {
                 log::error!("Heartbeat failed: {}", e);
                 HeartbeatResponse { error_code: 1 }
@@ -374,7 +345,10 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_leave_group(&self, request: LeaveGroupRequest) -> LeaveGroupResponse {
+    pub(crate) async fn handle_leave_group(
+        &self,
+        request: LeaveGroupRequest,
+    ) -> LeaveGroupResponse {
         match self
             .storage
             .leave_group(&request.group_id, &request.member_id)
@@ -388,7 +362,10 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         }
     }
 
-    async fn handle_commit_offset(&self, request: OffsetCommitRequest) -> OffsetCommitResponse {
+    pub(crate) async fn handle_commit_offset(
+        &self,
+        request: OffsetCommitRequest,
+    ) -> OffsetCommitResponse {
         let mut topics = Vec::new();
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
@@ -427,7 +404,10 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
         OffsetCommitResponse { topics }
     }
 
-    async fn handle_create_topic(&self, request: CreateTopicRequest) -> CreateTopicResponse {
+    pub(crate) async fn handle_create_topic(
+        &self,
+        request: CreateTopicRequest,
+    ) -> CreateTopicResponse {
         match self
             .storage
             .create_topic(&request.topic_name, request.num_partitions)
@@ -441,13 +421,16 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                 log::error!("Failed to create topic: {}", e);
                 CreateTopicResponse {
                     error_code: 1,
-                    error_message: e,
+                    error_message: e.to_string(),
                 }
             }
         }
     }
 
-    async fn handle_fetch_offset(&self, request: OffsetFetchRequest) -> OffsetFetchResponse {
+    pub(crate) async fn handle_fetch_offset(
+        &self,
+        request: OffsetFetchRequest,
+    ) -> OffsetFetchResponse {
         let mut topics = Vec::new();
         for topic_data in request.topics {
             let mut partition_results = Vec::new();

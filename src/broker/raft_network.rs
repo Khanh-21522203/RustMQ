@@ -72,7 +72,7 @@ impl RaftNetworkSender {
             match client {
                 Ok(mut c) => {
                     if let Err(e) = c.send_raft(Request::new(request)).await {
-                        log::debug!("Failed to send raft message to node {}: {}", msg.to, e);
+                        log::warn!("Failed to send raft message to node {}: {}", msg.to, e);
                     }
                 }
                 Err(e) => {
@@ -116,10 +116,15 @@ impl Raft for RaftServiceImpl {
         let data = request.into_inner().data;
         match <Message as RaftProstMessage>::decode(data.as_slice()) {
             Ok(msg) => {
-                let _ = self.step_tx.send(msg);
+                if self.step_tx.send(msg).is_err() {
+                    log::warn!("Dropped inbound raft message because step channel is closed");
+                }
                 Ok(Response::new(RaftReply::default()))
             }
-            Err(e) => Err(Status::invalid_argument(format!("decode error: {}", e))),
+            Err(e) => {
+                log::warn!("Failed to decode inbound raft message: {}", e);
+                Err(Status::invalid_argument(format!("decode error: {}", e)))
+            }
         }
     }
 }
