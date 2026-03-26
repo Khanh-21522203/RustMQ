@@ -186,14 +186,15 @@ impl RaftNode {
             ..Default::default()
         };
 
-        let mut conf_state = ConfState::default();
-        conf_state.voters = peers.read().unwrap().keys().copied().collect();
-        let storage = MemStorage::new_with_conf_state(conf_state);
-        let raw_node = RawNode::new(&config, storage, &logger)?;
-
+        // Open sled first so we can restore persisted peers before building ConfState.
         let (db, initial_data) = match storage_path {
             Some(ref path) => match sled::open(path) {
                 Ok(db) => {
+                    // Restore dynamically-added/removed peers from previous runs.
+                    if let Some(saved_peers) = load_peers_from_sled(&db) {
+                        log::info!("Restored {} peers from sled at {}", saved_peers.len(), path);
+                        *peers.write().unwrap() = saved_peers;
+                    }
                     let data = load_broker_data_from_sled(&db);
                     log::info!("Loaded BrokerData from sled at {}", path);
                     (Some(Arc::new(db)), data)
@@ -205,6 +206,11 @@ impl RaftNode {
             },
             None => (None, BrokerData::default()),
         };
+
+        let mut conf_state = ConfState::default();
+        conf_state.voters = peers.read().unwrap().keys().copied().collect();
+        let storage = MemStorage::new_with_conf_state(conf_state);
+        let raw_node = RawNode::new(&config, storage, &logger)?;
 
         let data = Arc::new(RwLock::new(initial_data));
         let is_leader = Arc::new(AtomicBool::new(false));
@@ -254,7 +260,7 @@ impl RaftNode {
                 }
                 Some((cmd, reply_tx)) = self.propose_rx.recv() => {
                     if self.raw_node.raft.state != StateRole::Leader {
-                        let _ = reply_tx.send(Err(anyhow::anyhow!("not leader")));
+                        let _ = reply_tx.send(Err(self.not_leader_error()));
                         continue;
                     }
                     let proposal_id = self.next_proposal_id;
@@ -276,7 +282,7 @@ impl RaftNode {
                 }
                 Some((cc, reply_tx)) = self.conf_change_rx.recv() => {
                     if self.raw_node.raft.state != StateRole::Leader {
-                        let _ = reply_tx.send(Err(anyhow::anyhow!("not leader")));
+                        let _ = reply_tx.send(Err(self.not_leader_error()));
                         continue;
                     }
                     // Only one conf change in flight at a time
@@ -298,6 +304,18 @@ impl RaftNode {
                 self.handle_ready().await;
             }
         }
+    }
+
+    fn not_leader_error(&self) -> anyhow::Error {
+        let leader_id = self.raw_node.raft.leader_id;
+        let leader_addr = self
+            .peers
+            .read()
+            .unwrap()
+            .get(&leader_id)
+            .map(|p| p.api_addr.clone())
+            .unwrap_or_default();
+        anyhow::anyhow!("NOT_LEADER:{}", leader_addr)
     }
 
     async fn handle_ready(&mut self) {
@@ -369,7 +387,9 @@ impl RaftNode {
             Ok(cc) => cc,
             Err(e) => {
                 log::error!("Failed to decode ConfChange: {}", e);
-                // Must still call apply_conf_change to keep raft-rs state consistent
+                // apply_conf_change MUST be called for every EntryConfChange to keep
+                // raft-rs state consistent, even when we cannot parse the entry.
+                let _ = self.raw_node.apply_conf_change(&ConfChange::default());
                 if let Some(tx) = self.pending_cc_reply.take() {
                     let _ = tx.send(Err(anyhow::anyhow!("decode failed: {}", e)));
                 }
@@ -400,6 +420,11 @@ impl RaftNode {
         } else if cc.change_type == ConfChangeType::RemoveNode as i32 {
             self.peers.write().unwrap().remove(&cc.node_id);
             log::info!("Removed node {} from peers map", cc.node_id);
+        }
+
+        // Persist the updated peers map so membership survives restarts.
+        if let Some(ref db) = self.db {
+            persist_peers_to_sled(db, &self.peers.read().unwrap());
         }
 
         if let Some(tx) = self.pending_cc_reply.take() {
@@ -528,6 +553,27 @@ pub fn load_broker_data_from_sled(db: &sled::Db) -> BrokerData {
     }
 
     data
+}
+
+/// Persist the current peers map to sled under the key `"peers"`.
+/// Called after every ConfChange so membership survives restarts.
+fn persist_peers_to_sled(db: &sled::Db, peers: &HashMap<u64, PeerInfo>) {
+    match bincode::serialize(peers) {
+        Ok(bytes) => {
+            if let Err(e) = db.insert(b"peers", bytes) {
+                log::error!("Failed to persist peers to sled: {}", e);
+            }
+        }
+        Err(e) => log::error!("Failed to serialize peers: {}", e),
+    }
+}
+
+/// Load the peers map from sled.  Returns `None` if no entry exists yet.
+fn load_peers_from_sled(db: &sled::Db) -> Option<HashMap<u64, PeerInfo>> {
+    db.get(b"peers")
+        .ok()
+        .flatten()
+        .and_then(|bytes| bincode::deserialize::<HashMap<u64, PeerInfo>>(&bytes).ok())
 }
 
 // ── RaftStorage ─────────────────────────────────────────────────────────────
@@ -709,6 +755,17 @@ impl RaftStorage {
         api_addr: String,
         rpc_addr: String,
     ) -> anyhow::Result<()> {
+        if !self.is_leader() {
+            let addr = self.leader_api_addr().unwrap_or_default();
+            anyhow::bail!("NOT_LEADER:{}", addr);
+        }
+        // Ensure rpc_addr has the http:// scheme required by tonic's gRPC transport.
+        // The SBE+TCP transport strips the scheme via bare_addr(), so it handles both.
+        let rpc_addr = if rpc_addr.starts_with("http") {
+            rpc_addr
+        } else {
+            format!("http://{}", rpc_addr)
+        };
         let peer_info = PeerInfo {
             api_addr,
             rpc_addr,
@@ -732,6 +789,10 @@ impl RaftStorage {
 
     /// Propose removing a voter node from the Raft cluster.
     pub async fn propose_remove_node(&self, node_id: u64) -> anyhow::Result<()> {
+        if !self.is_leader() {
+            let addr = self.leader_api_addr().unwrap_or_default();
+            anyhow::bail!("NOT_LEADER:{}", addr);
+        }
         let cc = ConfChange {
             change_type: ConfChangeType::RemoveNode as i32,
             node_id,

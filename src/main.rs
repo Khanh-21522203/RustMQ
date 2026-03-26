@@ -115,22 +115,31 @@ async fn run_broker(args: Args) -> Result<()> {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Cluster config missing"))?;
 
-            // Build peer map: node_id -> PeerInfo for all cluster members
+            // Build peer map: node_id -> PeerInfo for all cluster members.
+            // When join_addr is set this node is dynamically joining a running cluster;
+            // start with an empty conf so Raft doesn't elect us as a competing leader.
+            // The existing leader will replicate its log to us once it applies our AddNode
+            // ConfChange, at which point we'll adopt the full conf state via a snapshot.
             use broker::raft_network::PeerInfo;
-            let peers: std::collections::HashMap<u64, PeerInfo> = cluster
-                .initial_members
-                .iter()
-                .map(|m| {
-                    (
-                        m.node_id,
-                        PeerInfo {
-                            rpc_addr: format!("http://{}", m.rpc_addr),
-                            api_addr: m.api_addr.clone(),
-                            sbe_tcp_addr: m.sbe_tcp_addr.clone(),
-                        },
-                    )
-                })
-                .collect();
+            let peers: std::collections::HashMap<u64, PeerInfo> =
+                if config.join_addr.is_some() {
+                    std::collections::HashMap::new()
+                } else {
+                    cluster
+                        .initial_members
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.node_id,
+                                PeerInfo {
+                                    rpc_addr: format!("http://{}", m.rpc_addr),
+                                    api_addr: m.api_addr.clone(),
+                                    sbe_tcp_addr: m.sbe_tcp_addr.clone(),
+                                },
+                            )
+                        })
+                        .collect()
+                };
 
             let peer_count = peers.len();
             let transport_kind = config.transport.clone();
@@ -174,7 +183,8 @@ async fn run_broker(args: Args) -> Result<()> {
 
             log::info!("Raft broker started successfully on {}", config.api_addr);
 
-            // If join_addr is set, register this node with the existing cluster leader.
+            // If join_addr is set, register this node with the existing cluster.
+            // We follow leader redirects (error_code == 6) and retry on transient failures.
             if let Some(join_addr) = config.join_addr.clone() {
                 use crate::api::broker::AddNodeRequest;
                 use crate::client::kafka_broker_client::{KafkaBrokerClient, KafkaBrokerClientTrait};
@@ -184,30 +194,44 @@ async fn run_broker(args: Args) -> Result<()> {
                 tokio::spawn(async move {
                     // Give the local gRPC server a moment to bind.
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    match KafkaBrokerClient::new(&join_addr).await.map_err(|e| e.to_string()) {
-                        Ok(client) => {
-                            let req = tonic::Request::new(AddNodeRequest {
-                                node_id,
-                                api_addr,
-                                rpc_addr,
-                            });
-                            match client.add_node(req).await {
-                                Ok(resp) if resp.error_code == 0 => {
-                                    log::info!("Successfully joined cluster via {}", join_addr);
+
+                    let mut target = join_addr.clone();
+                    let max_attempts = 10u32;
+                    for attempt in 1..=max_attempts {
+                        match KafkaBrokerClient::new(&target).await.map_err(|e| e.to_string()) {
+                            Err(e) => {
+                                log::warn!("Attempt {}/{}: cannot connect to {}: {}", attempt, max_attempts, target, e);
+                            }
+                            Ok(client) => {
+                                let req = tonic::Request::new(AddNodeRequest {
+                                    node_id,
+                                    api_addr: api_addr.clone(),
+                                    rpc_addr: rpc_addr.clone(),
+                                });
+                                match client.add_node(req).await {
+                                    Ok(resp) if resp.error_code == 0 => {
+                                        log::info!("Successfully joined cluster via {}", target);
+                                        return;
+                                    }
+                                    Ok(resp) if resp.error_code == 6 && !resp.error_message.is_empty() => {
+                                        // Not the leader — redirect to the address in error_message.
+                                        log::info!("Redirecting AddNode to leader at {}", resp.error_message);
+                                        target = resp.error_message.clone();
+                                        // No back-off needed; the redirect is immediate.
+                                        continue;
+                                    }
+                                    Ok(resp) => {
+                                        log::warn!("Attempt {}/{}: AddNode rejected (code {}): {}", attempt, max_attempts, resp.error_code, resp.error_message);
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Attempt {}/{}: AddNode RPC failed: {}", attempt, max_attempts, e);
+                                    }
                                 }
-                                Ok(resp) => {
-                                    log::error!(
-                                        "Join failed (code {}): {}",
-                                        resp.error_code,
-                                        resp.error_message
-                                    );
-                                }
-                                Err(e) => log::error!("AddNode RPC failed: {}", e),
                             }
                         }
-                        Err(e) => log::error!("Could not connect to join_addr {}: {}", join_addr, e),
-
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
+                    log::error!("Failed to join cluster after {} attempts", max_attempts);
                 });
             }
         } else if config.durable {

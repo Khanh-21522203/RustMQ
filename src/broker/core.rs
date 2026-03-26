@@ -435,10 +435,32 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                 error_message: String::new(),
             },
             Err(e) => {
-                log::error!("Failed to add node: {}", e);
-                AddNodeResponse {
-                    error_code: 1,
-                    error_message: e.to_string(),
+                let msg = e.to_string();
+                let parsed = BrokerError::from_message(msg.clone());
+                let is_not_leader = matches!(parsed, BrokerError::NotLeader { .. })
+                    || msg.to_ascii_lowercase().contains("not leader");
+                if is_not_leader {
+                    // Return the current leader's API address so the caller can redirect.
+                    let leader_addr = if let Some(addr) = parsed.leader_addr() {
+                        addr.to_string()
+                    } else {
+                        let meta = self.storage.get_cluster_metadata().await;
+                        meta.brokers
+                            .iter()
+                            .find(|b| b.node_id == meta.leader_id)
+                            .map(|b| b.api_addr.clone())
+                            .unwrap_or_default()
+                    };
+                    AddNodeResponse {
+                        error_code: 6, // NOT_LEADER_FOR_PARTITION — redirect hint
+                        error_message: leader_addr,
+                    }
+                } else {
+                    log::error!("Failed to add node: {}", msg);
+                    AddNodeResponse {
+                        error_code: 1,
+                        error_message: msg,
+                    }
                 }
             }
         }
@@ -451,10 +473,31 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                 error_message: String::new(),
             },
             Err(e) => {
-                log::error!("Failed to remove node: {}", e);
-                RemoveNodeResponse {
-                    error_code: 1,
-                    error_message: e.to_string(),
+                let msg = e.to_string();
+                let parsed = BrokerError::from_message(msg.clone());
+                let is_not_leader = matches!(parsed, BrokerError::NotLeader { .. })
+                    || msg.to_ascii_lowercase().contains("not leader");
+                if is_not_leader {
+                    let leader_addr = if let Some(addr) = parsed.leader_addr() {
+                        addr.to_string()
+                    } else {
+                        let meta = self.storage.get_cluster_metadata().await;
+                        meta.brokers
+                            .iter()
+                            .find(|b| b.node_id == meta.leader_id)
+                            .map(|b| b.api_addr.clone())
+                            .unwrap_or_default()
+                    };
+                    RemoveNodeResponse {
+                        error_code: 6,
+                        error_message: leader_addr,
+                    }
+                } else {
+                    log::error!("Failed to remove node: {}", msg);
+                    RemoveNodeResponse {
+                        error_code: 1,
+                        error_message: msg,
+                    }
                 }
             }
         }
