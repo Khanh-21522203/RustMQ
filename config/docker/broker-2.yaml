@@ -23,4 +23,4 @@ raft:
   snapshot_threshold: 10000
   rebalance_timeout_ms: 30000
 
-log_level: "info"
+log_level: "debug"

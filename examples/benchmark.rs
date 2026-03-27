@@ -19,6 +19,13 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
+/// Broker endpoint used for all benchmark connections.
+/// Override with BROKER_ADDR env var to target an external cluster, e.g.:
+///   BROKER_ADDR=http://localhost:9092 cargo run --example benchmark
+fn broker_addr() -> String {
+    std::env::var("BROKER_ADDR").unwrap_or_else(|_| broker_addr().as_str().to_string())
+}
+
 struct BenchmarkHandler {
     counter: Arc<AtomicUsize>,
 }
@@ -69,7 +76,7 @@ async fn benchmark_producer_throughput(
         flush_interval_ms: 100,
     };
 
-    let producer = Producer::new("http://localhost:50051", config).await?;
+    let producer = Producer::new(broker_addr().as_str(), config).await?;
     let message = vec![0u8; message_size];
     let start = Instant::now();
 
@@ -112,11 +119,11 @@ async fn benchmark_e2e_latency(message_count: usize) -> Result<(Duration, Vec<Du
         poll_interval_ms: 10,
     };
 
-    let producer = Producer::new("http://localhost:50051", producer_config).await?;
+    let producer = Producer::new(broker_addr().as_str(), producer_config).await?;
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let mut consumer = Consumer::new("http://localhost:50051", consumer_config).await?;
+    let mut consumer = Consumer::new(broker_addr().as_str(), consumer_config).await?;
     let handler = BenchmarkHandler {
         counter: counter_clone,
     };
@@ -163,7 +170,7 @@ async fn benchmark_consumer_throughput(message_count: usize) -> Result<(Duration
         flush_interval_ms: 100,
     };
 
-    let producer = Producer::new("http://localhost:50051", producer_config).await?;
+    let producer = Producer::new(broker_addr().as_str(), producer_config).await?;
     for i in 0..message_count {
         let msg = ProducerMessage::new(format!("Message {}", i).as_bytes().to_vec());
         producer.send(msg).await?;
@@ -188,7 +195,7 @@ async fn benchmark_consumer_throughput(message_count: usize) -> Result<(Duration
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    let mut consumer = Consumer::new("http://localhost:50051", consumer_config).await?;
+    let mut consumer = Consumer::new(broker_addr().as_str(), consumer_config).await?;
     let handler = BenchmarkHandler {
         counter: counter_clone,
     };
@@ -214,11 +221,15 @@ async fn main() -> Result<()> {
     println!("║         Rust-MQ Performance Benchmark                  ║");
     println!("╚════════════════════════════════════════════════════════╝\n");
 
-    // Start broker
-    println!("🚀 Starting broker...");
-    start_broker("0.0.0.0:50051").await?;
-    sleep(Duration::from_secs(1)).await;
-    println!("✓ Broker started\n");
+    // Start broker (skipped when BROKER_ADDR points to an external cluster)
+    if std::env::var("BROKER_ADDR").is_err() {
+        println!("🚀 Starting broker...");
+        start_broker("0.0.0.0:50051").await?;
+        sleep(Duration::from_secs(1)).await;
+        println!("✓ Broker started\n");
+    } else {
+        println!("🔗 Using external broker: {}\n", broker_addr());
+    }
 
     // Test 1: Producer throughput with different message sizes
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

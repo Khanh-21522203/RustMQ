@@ -50,15 +50,6 @@ impl RaftNetworkSender {
         }
     }
 
-    /// Return the API address of a peer node (for leader-redirect hints).
-    pub fn peer_api_addr(&self, node_id: u64) -> Option<String> {
-        self.peers
-            .read()
-            .unwrap()
-            .get(&node_id)
-            .map(|p| p.api_addr.clone())
-    }
-
     pub async fn send_messages(&self, msgs: Vec<Message>) {
         for msg in msgs {
             if msg.to == self.node_id {
@@ -121,10 +112,6 @@ pub struct GrpcTransport(pub RaftNetworkSender);
 impl RaftTransport for GrpcTransport {
     async fn send_messages(&self, msgs: Vec<Message>) {
         self.0.send_messages(msgs).await;
-    }
-
-    fn peer_api_addr(&self, node_id: u64) -> Option<String> {
-        self.0.peer_api_addr(node_id)
     }
 }
 

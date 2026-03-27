@@ -87,14 +87,6 @@ impl ConnectionManager {
         }
     }
 
-    pub fn peer_api_addr(&self, node_id: u64) -> Option<String> {
-        self.peers
-            .read()
-            .unwrap()
-            .get(&node_id)
-            .map(|p| p.api_addr.clone())
-    }
-
     /// Strip "http://" prefix from rpc_addr (gRPC scheme not needed for raw TCP).
     fn bare_addr(addr: &str) -> String {
         addr.trim_start_matches("http://").to_owned()

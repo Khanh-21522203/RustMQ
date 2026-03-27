@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,34 +6,6 @@ use crate::broker::raft::{
     BrokerCommand, BrokerData, BrokerStoredMessage, GroupStatus, ReplicatedGroupMember,
     ReplicatedGroupState,
 };
-
-#[async_trait]
-pub trait BrokerStateStore: Send + Sync {
-    async fn load(&self) -> anyhow::Result<BrokerData>;
-    async fn save(&self, data: &BrokerData) -> anyhow::Result<()>;
-}
-
-pub struct ReplicatedStateMachine<S: BrokerStateStore> {
-    store: S,
-    data: BrokerData,
-}
-
-impl<S: BrokerStateStore> ReplicatedStateMachine<S> {
-    pub async fn open(store: S) -> anyhow::Result<Self> {
-        let data = store.load().await?;
-        Ok(Self { store, data })
-    }
-
-    pub async fn apply(&mut self, command: BrokerCommand) -> anyhow::Result<i64> {
-        let result = apply_raft_command(&mut self.data, &None, command);
-        self.store.save(&self.data).await?;
-        Ok(result)
-    }
-
-    pub fn snapshot(&self) -> &BrokerData {
-        &self.data
-    }
-}
 
 pub fn apply_raft_command(
     data: &mut BrokerData,

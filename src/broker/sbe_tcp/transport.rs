@@ -28,8 +28,4 @@ impl RaftTransport for SbeTcpTransport {
     async fn send_messages(&self, msgs: Vec<Message>) {
         self.manager.send_messages(msgs).await;
     }
-
-    fn peer_api_addr(&self, node_id: u64) -> Option<String> {
-        self.manager.peer_api_addr(node_id)
-    }
 }

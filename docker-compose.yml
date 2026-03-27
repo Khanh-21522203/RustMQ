@@ -6,7 +6,7 @@ services:
       - "9092:9092"
       - "19092:19092"
     volumes:
-      - broker1-data:/data/broker-1
+      - ./data/broker-1:/data/broker-1
     networks:
       - rustmq
     healthcheck:
@@ -23,7 +23,7 @@ services:
       - "9093:9092"
       - "19093:19092"
     volumes:
-      - broker2-data:/data/broker-2
+      - ./data/broker-2:/data/broker-2
     networks:
       - rustmq
     depends_on:
@@ -37,17 +37,12 @@ services:
       - "9094:9092"
       - "19094:19092"
     volumes:
-      - broker3-data:/data/broker-3
+      - ./data/broker-3:/data/broker-3
     networks:
       - rustmq
     depends_on:
       broker-1:
         condition: service_healthy
-
-volumes:
-  broker1-data:
-  broker2-data:
-  broker3-data:
 
 networks:
   rustmq:

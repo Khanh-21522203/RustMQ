@@ -53,7 +53,8 @@ pub struct ProducerResult {
 /// Kafka Producer
 pub struct Producer {
     config: ProducerConfig,
-    client: Arc<KafkaBrokerClient>,
+    /// Mutable client so that NOT_LEADER redirects can update the target broker.
+    client: Arc<Mutex<Arc<KafkaBrokerClient>>>,
     batch: Arc<Mutex<Vec<ProducerMessage>>>,
     shutdown_tx: mpsc::Sender<()>,
     /// Counter for round-robin partition assignment
@@ -63,11 +64,12 @@ pub struct Producer {
 impl Producer {
     /// Create a new producer and start the background flush task.
     pub async fn new(broker_address: &str, config: ProducerConfig) -> Result<Self> {
-        let client = Arc::new(
+        let inner_client = Arc::new(
             KafkaBrokerClient::new(broker_address)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to connect to broker: {}", e))?,
         );
+        let client = Arc::new(Mutex::new(inner_client));
         let batch = Arc::new(Mutex::new(Vec::new()));
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -155,7 +157,8 @@ impl Producer {
             }],
         });
 
-        let response = self.client.produce(request).await?;
+        let client = self.client.lock().await.clone();
+        let response = client.produce(request).await?;
         for topic_result in response.results {
             for partition_result in topic_result.partitions {
                 if partition_result.error_code == 0 {
@@ -217,7 +220,7 @@ impl Producer {
     }
 
     async fn send_batch_inner(
-        client: &KafkaBrokerClient,
+        client_holder: &Arc<Mutex<Arc<KafkaBrokerClient>>>,
         config: &ProducerConfig,
         messages: Vec<ProducerMessage>,
         counter: &Arc<AtomicU64>,
@@ -242,20 +245,26 @@ impl Producer {
             .map(|(partition, records)| produce_request::PartitionData { partition, records })
             .collect();
 
-        let request = Request::new(ProduceRequest {
+        let produce_req = ProduceRequest {
             required_acks: config.required_acks,
             timeout_ms: config.timeout_ms,
             topics: vec![produce_request::TopicData {
                 topic_name: config.topic.clone(),
                 partitions,
             }],
-        });
+        };
 
-        let response = client.produce(request).await?;
+        let client = client_holder.lock().await.clone();
+        let response = client.produce(Request::new(produce_req.clone())).await?;
+
+        // Check if any partition returned NOT_LEADER (error_code=6) with a redirect address.
+        let mut leader_redirect: Option<String> = None;
         let mut failed_partitions = Vec::new();
-        for topic_result in response.results {
-            for partition_result in topic_result.partitions {
-                if partition_result.error_code != 0 {
+        for topic_result in &response.results {
+            for partition_result in &topic_result.partitions {
+                if partition_result.error_code == 6 && !partition_result.leader_addr.is_empty() {
+                    leader_redirect = Some(partition_result.leader_addr.clone());
+                } else if partition_result.error_code != 0 {
                     log::warn!(
                         "Failed to send to partition {}: error_code={}",
                         partition_result.partition,
@@ -271,6 +280,38 @@ impl Producer {
                 }
             }
         }
+
+        if let Some(leader_addr) = leader_redirect {
+            log::info!("NOT_LEADER — redirecting to leader at {}", leader_addr);
+            let new_client = Arc::new(
+                KafkaBrokerClient::new(&leader_addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to connect to leader {}: {}", leader_addr, e))?,
+            );
+            *client_holder.lock().await = new_client.clone();
+
+            // Retry once against the leader.
+            let retry_response = new_client.produce(Request::new(produce_req)).await?;
+            for topic_result in &retry_response.results {
+                for partition_result in &topic_result.partitions {
+                    if partition_result.error_code != 0 {
+                        anyhow::bail!(
+                            "Produce to leader failed for partition {}: error_code={}",
+                            partition_result.partition,
+                            partition_result.error_code
+                        );
+                    } else {
+                        log::debug!(
+                            "Batch sent (after redirect): partition={}, offset={}",
+                            partition_result.partition,
+                            partition_result.offset
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         if !failed_partitions.is_empty() {
             anyhow::bail!("Produce failed for partitions: {:?}", failed_partitions);
         }

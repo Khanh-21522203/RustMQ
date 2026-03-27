@@ -9,6 +9,7 @@ use std::sync::{
 };
 use tokio::sync::{mpsc, oneshot, RwLock};
 
+use crate::broker::config::RaftConfig;
 use crate::broker::raft_network::{GrpcTransport, PeerInfo, RaftGrpcServer, RaftNetworkSender};
 use crate::broker::raft_transport::RaftTransport;
 
@@ -146,6 +147,7 @@ impl RaftNode {
         node_id: u64,
         peers: HashMap<u64, PeerInfo>,
         storage_path: Option<String>,
+        raft_config: Option<RaftConfig>,
     ) -> Result<(Self, RaftStorage, RaftGrpcServer), raft::Error> {
         let peers_arc = Arc::new(std::sync::RwLock::new(peers));
         let (step_tx, step_rx) = mpsc::unbounded_channel();
@@ -159,6 +161,7 @@ impl RaftNode {
             transport,
             step_tx,
             step_rx,
+            raft_config,
         )?;
         Ok((node, storage, grpc_server))
     }
@@ -173,16 +176,28 @@ impl RaftNode {
         transport: Box<dyn RaftTransport>,
         step_tx: mpsc::UnboundedSender<Message>,
         step_rx: mpsc::UnboundedReceiver<Message>,
+        raft_config: Option<RaftConfig>,
     ) -> Result<(Self, RaftStorage), raft::Error> {
         let decorator = slog_term::TermDecorator::new().build();
         let drain = slog_term::CompactFormat::new(decorator).build().fuse();
         let drain = slog_async::Async::new(drain).build().fuse();
         let logger = Logger::root(drain, o!("tag" => format!("node-{}", node_id)));
 
+        // Each raft tick fires every 100 ms. Convert wall-clock config values to tick counts.
+        const TICK_MS: u64 = 100;
+        let cfg = raft_config.unwrap_or_default();
+        let heartbeat_tick = ((cfg.heartbeat_interval_ms / TICK_MS) as usize).max(1);
+        // raft-rs randomises election timeout between election_tick and 2*election_tick,
+        // so setting election_tick = min_ms / TICK_MS gives the right lower bound.
+        let election_tick = ((cfg.election_timeout_min_ms / TICK_MS) as usize).max(heartbeat_tick + 1);
+
         let config = Config {
             id: node_id,
-            election_tick: 10,
-            heartbeat_tick: 3,
+            election_tick,
+            heartbeat_tick,
+            // Pre-vote prevents nodes with stale logs from disrupting a live leader by
+            // bumping the cluster term every time they election-timeout during catch-up.
+            pre_vote: true,
             ..Default::default()
         };
 

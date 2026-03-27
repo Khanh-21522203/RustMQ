@@ -66,6 +66,10 @@ impl MultiBroker {
         let server_handle: RaftServerHandle;
         let raft_node;
         let raft_storage;
+        let rebalance_timeout_ms = raft_config
+            .as_ref()
+            .map(|r| r.rebalance_timeout_ms)
+            .unwrap_or(RaftConfig::default().rebalance_timeout_ms);
 
         if transport_kind == "sbe_tcp" {
             let (step_tx, step_rx) = mpsc::unbounded_channel();
@@ -79,6 +83,7 @@ impl MultiBroker {
                 Box::new(transport),
                 step_tx,
                 step_rx,
+                raft_config,
             )
             .map_err(|e| format!("Failed to create raft node: {:?}", e))?;
             raft_node = node;
@@ -86,7 +91,7 @@ impl MultiBroker {
             server_handle = RaftServerHandle::SbeTcp(sbe_server);
         } else {
             // Default: gRPC
-            let (node, storage, grpc_server) = RaftNode::new(node_id, peers, storage_path)
+            let (node, storage, grpc_server) = RaftNode::new(node_id, peers, storage_path, raft_config)
                 .map_err(|e| format!("Failed to create raft node: {:?}", e))?;
             raft_node = node;
             raft_storage = storage;
@@ -156,10 +161,6 @@ impl MultiBroker {
             heartbeats: HashMap::new(),
         }));
         {
-            let rebalance_timeout_ms = raft_config
-                .as_ref()
-                .map(|r| r.rebalance_timeout_ms)
-                .unwrap_or(RaftConfig::default().rebalance_timeout_ms);
             let storage = raft_storage.clone();
             let local_clone = local.clone();
             tokio::spawn(async move {

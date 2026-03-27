@@ -8,7 +8,4 @@ use raft::eraftpb::Message;
 pub trait RaftTransport: Send + Sync + 'static {
     /// Send outbound Raft messages.  Messages to self.node_id must be dropped.
     async fn send_messages(&self, msgs: Vec<Message>);
-
-    /// Return the client-facing API address of a peer (for leader-redirect hints).
-    fn peer_api_addr(&self, node_id: u64) -> Option<String>;
 }

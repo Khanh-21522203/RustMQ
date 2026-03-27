@@ -33,33 +33,6 @@ pub trait MessageHandler: Send + Sync {
     async fn handle(&self, message: ConsumedMessage) -> Result<()>;
 }
 
-/// Simple function-based message handler
-pub struct FnHandler<F>
-where
-    F: Fn(ConsumedMessage) -> Result<()> + Send + Sync,
-{
-    handler: F,
-}
-
-impl<F> FnHandler<F>
-where
-    F: Fn(ConsumedMessage) -> Result<()> + Send + Sync,
-{
-    pub fn new(handler: F) -> Self {
-        Self { handler }
-    }
-}
-
-#[async_trait::async_trait]
-impl<F> MessageHandler for FnHandler<F>
-where
-    F: Fn(ConsumedMessage) -> Result<()> + Send + Sync,
-{
-    async fn handle(&self, message: ConsumedMessage) -> Result<()> {
-        (self.handler)(message)
-    }
-}
-
 /// Kafka Consumer with multi-partition support
 pub struct Consumer {
     config: ConsumerConfig,
