@@ -1,20 +1,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tokio::sync::{mpsc, Mutex};
-use tonic::{Request, Response, Status};
-// Use prost 0.11 (the version raft uses) to encode/decode eraftpb::Message
+use tokio::sync::Mutex;
+use tonic::Request;
 use prost_raft::Message as RaftProstMessage;
+use raft::eraftpb::Message;
+
+use crate::broker::raft_transport::RaftTransport;
 
 pub mod raft_proto {
     tonic::include_proto!("raft");
 }
 
-use raft::eraftpb::Message;
 use raft_proto::raft_client::RaftClient;
-use raft_proto::raft_server::Raft;
-use raft_proto::{RaftMessage, RaftReply};
-
-use crate::broker::raft_transport::RaftTransport;
 
 // ── Peer info ─────────────────────────────────────────────────────────────────
 
@@ -51,6 +48,7 @@ impl RaftNetworkSender {
     }
 
     pub async fn send_messages(&self, msgs: Vec<Message>) {
+        use raft_proto::{RaftMessage};
         for msg in msgs {
             if msg.to == self.node_id {
                 continue; // never send to self
@@ -89,7 +87,7 @@ impl RaftNetworkSender {
     async fn get_or_connect(
         &self,
         node_id: u64,
-        addr: String, // rpc_addr
+        addr: String,
     ) -> anyhow::Result<RaftClient<tonic::transport::Channel>> {
         let mut pool = self.pool.lock().await;
         if let Some(client) = pool.get(&node_id) {
@@ -112,60 +110,5 @@ pub struct GrpcTransport(pub RaftNetworkSender);
 impl RaftTransport for GrpcTransport {
     async fn send_messages(&self, msgs: Vec<Message>) {
         self.0.send_messages(msgs).await;
-    }
-}
-
-// ── Inbound: receive Raft messages from peers ─────────────────────────────────
-
-/// tonic service implementation that receives Raft messages from peers
-/// and forwards them to the local RawNode via a channel.
-pub struct RaftServiceImpl {
-    step_tx: mpsc::UnboundedSender<Message>,
-}
-
-#[tonic::async_trait]
-impl Raft for RaftServiceImpl {
-    async fn send_raft(
-        &self,
-        request: Request<RaftMessage>,
-    ) -> Result<Response<RaftReply>, Status> {
-        let data = request.into_inner().data;
-        match <Message as RaftProstMessage>::decode(data.as_slice()) {
-            Ok(msg) => {
-                if self.step_tx.send(msg).is_err() {
-                    log::warn!("Dropped inbound raft message because step channel is closed");
-                }
-                Ok(Response::new(RaftReply::default()))
-            }
-            Err(e) => {
-                log::warn!("Failed to decode inbound raft message: {}", e);
-                Err(Status::invalid_argument(format!("decode error: {}", e)))
-            }
-        }
-    }
-}
-
-// ── RaftGrpcServer ────────────────────────────────────────────────────────────
-
-/// Thin wrapper around the Raft tonic server. Call `serve()` to start listening.
-pub struct RaftGrpcServer {
-    service: RaftServiceImpl,
-}
-
-impl RaftGrpcServer {
-    pub fn new(step_tx: mpsc::UnboundedSender<Message>) -> Self {
-        Self {
-            service: RaftServiceImpl { step_tx },
-        }
-    }
-
-    pub async fn serve(self, addr: &str) -> anyhow::Result<()> {
-        let addr = addr.parse()?;
-        log::info!("Raft RPC server listening on {}", addr);
-        tonic::transport::Server::builder()
-            .add_service(raft_proto::raft_server::RaftServer::new(self.service))
-            .serve(addr)
-            .await?;
-        Ok(())
     }
 }

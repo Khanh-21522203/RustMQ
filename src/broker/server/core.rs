@@ -2,8 +2,8 @@ use crate::api::broker::*;
 use crate::api::requests::BrokerGrpcRequest;
 use crate::api::responses::BrokerGrpcResponse;
 use crate::broker::error::BrokerError;
-use crate::broker::rpc_router::BrokerRpcRouter;
-use crate::broker::storage::BrokerStorage;
+use crate::broker::server::rpc_router::BrokerRpcRouter;
+use crate::broker::storage::traits::BrokerStorage;
 use tokio::sync::{mpsc, oneshot};
 
 fn parse_api_addr(addr: &str) -> (String, i32) {

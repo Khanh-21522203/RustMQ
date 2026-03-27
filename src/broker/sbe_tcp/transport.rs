@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use raft::eraftpb::Message;
 
-use crate::broker::raft_network::PeerInfo;
+use crate::broker::PeerInfo;
 use crate::broker::raft_transport::RaftTransport;
 
 use super::connection::ConnectionManager;

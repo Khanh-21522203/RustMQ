@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::broker::partition_log::PartitionLog;
+use crate::broker::kraft::partition_log::PartitionLog;
 
 // ── ReplicaFetcher trait ──────────────────────────────────────────────────────
 

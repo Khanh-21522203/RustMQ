@@ -7,7 +7,8 @@
 /// 4. Demonstrates graceful shutdown
 use anyhow::Result;
 use rust_mq::broker::{
-    core::BrokerCore, kafka_broker_server::KafkaBrokerServer, storage::InMemoryStorage,
+    server::core::BrokerCore, server::kafka_server::KafkaBrokerServer,
+    storage::traits::InMemoryStorage,
 };
 use rust_mq::client::{
     ConsumedMessage, Consumer, ConsumerConfig, MessageHandler, Producer, ProducerConfig,

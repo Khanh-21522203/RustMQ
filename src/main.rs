@@ -94,107 +94,49 @@ async fn main() -> Result<()> {
 
 async fn run_broker(args: Args) -> Result<()> {
     use broker::config::BrokerConfig;
-    use broker::core::BrokerCore;
-    use broker::kafka_broker_server::KafkaBrokerServer;
-    use broker::storage::InMemoryStorage;
+    use broker::server::core::BrokerCore;
+    use broker::server::kafka_server::KafkaBrokerServer;
+    use broker::storage::traits::InMemoryStorage;
     use tokio::sync::mpsc;
 
+    // Config file provided → always use KRaft (durable, works for both single-node and cluster).
+    // No config file → in-memory single-node (fast dev/test mode).
     if let Some(config_path) = args.config {
         log::info!("Starting broker from config: {}", config_path);
         let config = BrokerConfig::from_file(&config_path)?;
-        if config.is_cluster_mode() {
-            log::info!(
-                "Starting KRaft broker node {} on API: {}",
-                config.node_id,
-                config.api_addr
-            );
-            return run_kraft_cluster(config).await;
-        } else if config.durable {
-            // Single-node with sled-backed durable storage
-            let (broker_host, broker_port) = parse_host_port(&config.api_addr);
-            log::info!(
-                "Starting durable single Kafka broker on {} (sled: {})",
-                config.api_addr,
-                config.storage_path
-            );
-
-            let (rpc_tx, rpc_rx) = mpsc::channel(1000);
-            let storage = broker::sled_storage::SledStorage::open_with_retention(
-                config.node_id as i32,
-                broker_host,
-                broker_port,
-                &config.storage_path,
-                config.retention.clone(),
-            )?;
-            let broker_core = BrokerCore::new(rpc_rx, storage);
-            tokio::spawn(async move {
-                broker_core.run().await;
-            });
-
-            let grpc_server = KafkaBrokerServer::new(rpc_tx);
-            let api_addr = config.api_addr.clone();
-            tokio::spawn(async move {
-                if let Err(e) = grpc_server.run(&api_addr).await {
-                    log::error!("Failed to start broker: {}", e);
-                }
-            });
-
-            log::info!("Durable single broker started successfully");
-        } else {
-            // Single-node with config file (in-memory)
-            let (broker_host, broker_port) = parse_host_port(&config.api_addr);
-            log::info!("Starting single Kafka broker on {}", config.api_addr);
-
-            let (rpc_tx, rpc_rx) = mpsc::channel(1000);
-            let storage = InMemoryStorage::new_with_retention(
-                config.node_id as i32,
-                broker_host,
-                broker_port,
-                config.retention.clone(),
-            );
-            let broker_core = BrokerCore::new(rpc_rx, storage);
-            tokio::spawn(async move {
-                broker_core.run().await;
-            });
-
-            let grpc_server = KafkaBrokerServer::new(rpc_tx);
-            let api_addr = config.api_addr.clone();
-            tokio::spawn(async move {
-                if let Err(e) = grpc_server.run(&api_addr).await {
-                    log::error!("Failed to start broker: {}", e);
-                }
-            });
-
-            log::info!("Single broker started successfully");
-        }
-    } else {
-        // Single-node with built-in defaults
-        let config = BrokerConfig::default_single_node();
-        log::info!("Starting single Kafka broker on {}", config.api_addr);
-
-        let (rpc_tx, rpc_rx) = mpsc::channel(1000);
-        let (broker_host, broker_port) = parse_host_port(&config.api_addr);
-        let storage = InMemoryStorage::new_with_retention(
-            config.node_id as i32,
-            broker_host,
-            broker_port,
-            config.retention.clone(),
+        log::info!(
+            "Starting KRaft broker node {} on {} (storage: {})",
+            config.node_id,
+            config.api_addr,
+            config.storage_path
         );
-        let broker_core = BrokerCore::new(rpc_rx, storage);
-        tokio::spawn(async move {
-            broker_core.run().await;
-        });
-
-        let grpc_server = KafkaBrokerServer::new(rpc_tx);
-        let api_addr = config.api_addr.clone();
-        tokio::spawn(async move {
-            if let Err(e) = grpc_server.run(&api_addr).await {
-                log::error!("Failed to start broker: {}", e);
-            }
-        });
-
-        log::info!("Single broker started successfully");
+        return run_kraft_cluster(config).await;
     }
+
+    // No config file — in-memory single-node (dev mode).
+    let config = BrokerConfig::default_single_node();
+    log::info!("Starting in-memory single broker on {} (dev mode)", config.api_addr);
+
+    let (rpc_tx, rpc_rx) = mpsc::channel(1000);
+    let (broker_host, broker_port) = parse_host_port(&config.api_addr);
+    let storage = InMemoryStorage::new_with_retention(
+        config.node_id as i32,
+        broker_host,
+        broker_port,
+        config.retention.clone(),
+    );
+    let broker_core = BrokerCore::new(rpc_rx, storage);
+    tokio::spawn(async move {
+        broker_core.run().await;
+    });
+
+    let grpc_server = KafkaBrokerServer::new(rpc_tx);
+    let api_addr = config.api_addr.clone();
+    tokio::spawn(async move {
+        if let Err(e) = grpc_server.run(&api_addr).await {
+            log::error!("Failed to start broker: {}", e);
+        }
+    });
 
     // Wait for shutdown signal
     signal::ctrl_c().await?;
@@ -204,39 +146,37 @@ async fn run_broker(args: Args) -> Result<()> {
 }
 
 async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
-    use broker::controller_raft::ControllerRaftNode;
-    use broker::core::BrokerCore;
-    use broker::kafka_broker_server::KafkaBrokerServer;
-    use broker::kraft_broker::{ControllerHandle, KRaftBroker};
-    use broker::raft_network::PeerInfo;
+    use broker::controller::raft_node::ControllerRaftNode;
+    use broker::server::core::BrokerCore;
+    use broker::server::kafka_server::KafkaBrokerServer;
+    use broker::kraft::broker::{ControllerHandle, KRaftBroker};
+    use broker::PeerInfo;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    let cluster = config
-        .cluster
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Cluster config missing"))?;
-
-    // Build peer map. When join_addr is set start empty — the leader will
-    // replicate its log (including our AddNode ConfChange) once we join.
-    let peers: std::collections::HashMap<u64, PeerInfo> = if config.join_addr.is_some() {
-        std::collections::HashMap::new()
-    } else {
-        cluster
-            .initial_members
-            .iter()
-            .map(|m| {
-                (
-                    m.node_id,
-                    PeerInfo {
-                        rpc_addr: format!("http://{}", m.rpc_addr),
-                        api_addr: m.api_addr.clone(),
-                        sbe_tcp_addr: m.sbe_tcp_addr.clone(),
-                    },
-                )
-            })
-            .collect()
-    };
+    // Build peer map.
+    // - Single-node (no cluster config): empty — this node bootstraps alone.
+    // - Joining an existing cluster (join_addr set): empty — leader replicates log after join.
+    // - Multi-node bootstrap: seed from initial_members.
+    let peers: std::collections::HashMap<u64, PeerInfo> =
+        if config.join_addr.is_some() || config.cluster.is_none() {
+            std::collections::HashMap::new()
+        } else {
+            config.cluster.as_ref().unwrap()
+                .initial_members
+                .iter()
+                .map(|m| {
+                    (
+                        m.node_id,
+                        PeerInfo {
+                            rpc_addr: format!("http://{}", m.rpc_addr),
+                            api_addr: m.api_addr.clone(),
+                            sbe_tcp_addr: m.sbe_tcp_addr.clone(),
+                        },
+                    )
+                })
+                .collect()
+        };
 
     let rebalance_timeout_ms = config
         .raft
@@ -274,7 +214,7 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
         storage
     } else {
         // gRPC (default)
-        use broker::raft_network::{GrpcTransport, RaftGrpcServer, RaftNetworkSender};
+        use broker::grpc::{GrpcTransport, RaftGrpcServer, RaftNetworkSender};
 
         let peers_arc = Arc::new(std::sync::RwLock::new(peers));
         let (step_tx, step_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -382,7 +322,7 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
     // Failure detector task: runs only on the active controller (leader).
     // Every 5 s scan brokers; declare dead if last_seen_ms > 0 and gap > 15 s.
     {
-        use broker::controller_state_machine::compute_failover_assignments;
+        use broker::controller::state_machine::compute_failover_assignments;
         let ctrl_fd = controller.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));

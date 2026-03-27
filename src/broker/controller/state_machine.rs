@@ -1,4 +1,4 @@
-use crate::broker::controller_types::{
+use crate::broker::controller::types::{
     BrokerRegistration, ControllerCommand, ControllerMetadata, PartitionRecord, TopicRecord,
 };
 use std::collections::HashSet;
@@ -123,7 +123,7 @@ pub fn apply_controller_command(meta: &mut ControllerMetadata, cmd: ControllerCo
 pub fn compute_failover_assignments(
     meta: &ControllerMetadata,
     dead_broker_id: u64,
-) -> Vec<crate::broker::controller_types::PartitionAssignment> {
+) -> Vec<crate::broker::controller::types::PartitionAssignment> {
     let alive: HashSet<u64> = meta
         .brokers
         .keys()
@@ -142,7 +142,7 @@ pub fn compute_failover_assignments(
                 .filter(|&id| id != dead_broker_id && alive.contains(&id))
                 .collect();
             let new_leader = new_isr.first().copied().unwrap_or(0);
-            crate::broker::controller_types::PartitionAssignment {
+            crate::broker::controller::types::PartitionAssignment {
                 topic: topic.clone(),
                 partition: *partition,
                 new_leader,
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn mark_broker_dead_removes_broker_and_reassigns_partitions() {
-        use crate::broker::controller_types::PartitionAssignment;
+        use crate::broker::controller::types::PartitionAssignment;
         let mut meta = ControllerMetadata::default();
         meta.brokers.insert(1, registered_broker(1));
         meta.brokers.insert(2, registered_broker(2));

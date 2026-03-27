@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
-use crate::broker::storage::StoredMessage;
+use crate::broker::storage::traits::StoredMessage;
 
 /// A single log entry stored in a partition.
 #[derive(Debug, Clone, Serialize, Deserialize)]

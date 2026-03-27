@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::broker::consumer_group_coordinator::ConsumerGroupCoordinator;
-use crate::broker::controller_types::ControllerMetadata;
+use crate::broker::server::consumer_group::ConsumerGroupCoordinator;
+use crate::broker::controller::types::ControllerMetadata;
 use crate::broker::error::{BrokerError, BrokerResult};
-use crate::broker::isr_manager::IsrManager;
-use crate::broker::partition_log::PartitionLog;
-use crate::broker::replication_manager::ReplicationManager;
-use crate::broker::storage::{
+use crate::broker::kraft::isr_manager::IsrManager;
+use crate::broker::kraft::partition_log::PartitionLog;
+use crate::broker::kraft::replication_manager::ReplicationManager;
+use crate::broker::storage::traits::{
     validate_topic_name, BrokerInfo, BrokerStorage, ClusterMetadata, GroupMember, StoredMessage,
 };
 
@@ -71,7 +71,7 @@ pub trait ControllerHandle: Send + Sync {
     async fn propose_mark_broker_dead(
         &self,
         broker_id: u64,
-        new_assignments: Vec<crate::broker::controller_types::PartitionAssignment>,
+        new_assignments: Vec<crate::broker::controller::types::PartitionAssignment>,
     ) -> anyhow::Result<()>;
 }
 
@@ -537,8 +537,8 @@ fn parse_api_addr(addr: &str) -> (String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::controller_state_machine::apply_controller_command;
-    use crate::broker::controller_types::{BrokerRegistration, ControllerCommand};
+    use crate::broker::controller::state_machine::apply_controller_command;
+    use crate::broker::controller::types::{BrokerRegistration, ControllerCommand};
 
     // ── MockControllerHandle ─────────────────────────────────────────────────
 
@@ -687,10 +687,10 @@ mod tests {
         async fn propose_mark_broker_dead(
             &self,
             broker_id: u64,
-            new_assignments: Vec<crate::broker::controller_types::PartitionAssignment>,
+            new_assignments: Vec<crate::broker::controller::types::PartitionAssignment>,
         ) -> anyhow::Result<()> {
-            use crate::broker::controller_state_machine::apply_controller_command;
-            use crate::broker::controller_types::ControllerCommand;
+            use crate::broker::controller::state_machine::apply_controller_command;
+            use crate::broker::controller::types::ControllerCommand;
             let mut meta = self.meta.write().await;
             apply_controller_command(
                 &mut meta,
@@ -770,16 +770,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn create_topic_round_robin_assignment() {
-        // 3 brokers registered, rf=2, 6 partitions.
-        // Expected assignment (start = p % 3):
-        //   p0: brokers [1,2], leader=1
-        //   p1: brokers [2,3], leader=2
-        //   p2: brokers [3,1], leader=3
-        //   p3: brokers [1,2], leader=1
-        //   p4: brokers [2,3], leader=2
-        //   p5: brokers [3,1], leader=3
         let ctrl = MockController::new(1, "127.0.0.1:9092");
-        // Register brokers 1, 2, 3.
         for id in [1u64, 2, 3] {
             ctrl.meta.write().await.brokers.insert(
                 id,
@@ -820,7 +811,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn create_topic_rf_clamped_to_broker_count() {
-        // rf=3 but only 2 brokers — each partition should get 2 replicas.
         let ctrl = MockController::new(1, "127.0.0.1:9092");
         for id in [1u64, 2] {
             ctrl.meta.write().await.brokers.insert(
@@ -887,9 +877,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn produce_to_non_leader_returns_not_leader() {
-        // Partition 0 has leader = node 2; this broker is node 1.
         let ctrl = MockController::new(1, "127.0.0.1:9092");
-        // seed: create topic, but assign leader = 2
         {
             let mut meta = ctrl.meta.write().await;
             apply_controller_command(
@@ -958,8 +946,6 @@ mod tests {
         }
     }
 
-    // ── Partition offset tests ─────────────────────────────────────────────────
-
     #[tokio::test(flavor = "multi_thread")]
     async fn get_partition_offset_latest_equals_leo() {
         let (broker, _) = make_broker_with_topic(1, "t", 1).await;
@@ -992,8 +978,6 @@ mod tests {
         assert_eq!(earliest, vec![0]);
     }
 
-    // ── Consumer offset tests ─────────────────────────────────────────────────
-
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_and_fetch_offset() {
         let (broker, _) = make_broker(1).await;
@@ -1013,8 +997,6 @@ mod tests {
         assert_eq!(off, -1);
     }
 
-    // ── Group coordinator delegation ──────────────────────────────────────────
-
     #[tokio::test(flavor = "multi_thread")]
     async fn join_group_delegates_to_coordinator() {
         let (broker, _) = make_broker_with_topic(1, "t", 2).await;
@@ -1027,8 +1009,6 @@ mod tests {
         assert_eq!(member_id, "m1");
         assert_eq!(members.len(), 1);
     }
-
-    // ── Cluster metadata ──────────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
     async fn get_cluster_metadata_reflects_brokers() {
@@ -1061,14 +1041,10 @@ mod tests {
         assert_eq!(meta.leader_id, 1);
     }
 
-    /// `produce_message_acks_all` resolves immediately when the partition has a
-    /// single replica (ISR = [leader]) because the leader advances HW itself.
     #[tokio::test(flavor = "multi_thread")]
     async fn produce_acks_all_single_replica_resolves_immediately() {
         let (broker, _) = make_broker_with_topic(1, "t", 1).await;
-        // Single-replica ISR — leader advances HW immediately on each append.
         broker.on_became_leader("t", 0, vec![1]).await;
-        // Tick once so the ISR manager advances HW to LEO (single-node path).
         broker.isr_mgr.tick().await;
 
         let offset = broker
@@ -1077,36 +1053,29 @@ mod tests {
             .unwrap();
         assert_eq!(offset, 0);
 
-        // HW must be at least offset+1 after the call returns.
         let store = broker.partition_store.read().await;
         let log = store.get(&("t".to_string(), 0)).unwrap();
         assert!(log.high_watermark() >= 1);
     }
 
-    /// `produce_message_acks_all` waits for HW if it hasn't advanced yet, and
-    /// resolves once an external caller advances it (simulating a follower ack).
     #[tokio::test(flavor = "multi_thread")]
     async fn produce_acks_all_waits_for_hw_advance() {
         let (broker, _) = make_broker_with_topic(1, "t", 1).await;
         broker.on_became_leader("t", 0, vec![1]).await;
 
-        // Get the log before producing so we can advance HW from a separate task.
         let log = {
             let store = broker.partition_store.read().await;
             store.get(&("t".to_string(), 0)).cloned().unwrap()
         };
 
-        // Spawn the acks=all produce — it will block waiting for HW >= 1.
         let broker = Arc::new(broker);
         let b = broker.clone();
         let produce_handle = tokio::spawn(async move {
             b.produce_message_acks_all("t", 0, None, b"msg".to_vec()).await
         });
 
-        // Give the produce task a moment to start waiting.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Simulate replication: advance HW to 1.
         log.advance_hw(1).unwrap();
 
         let offset = produce_handle.await.unwrap().unwrap();

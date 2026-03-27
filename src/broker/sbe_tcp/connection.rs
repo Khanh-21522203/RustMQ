@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use super::codec;
 use super::pool::BufferPool;
-use crate::broker::raft_network::PeerInfo;
+use crate::broker::PeerInfo;
 
 /// A framed buffer ready to write on the wire: 4-byte LE length + SBE payload.
 struct Frame {

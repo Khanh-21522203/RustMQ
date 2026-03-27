@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 
 use crate::broker::config::DEFAULT_REBALANCE_TIMEOUT_MS;
 use crate::broker::error::{BrokerError, BrokerResult};
-use crate::broker::storage::GroupMember;
+use crate::broker::storage::traits::GroupMember;
 
 // ── Internal state ────────────────────────────────────────────────────────────
 
@@ -400,22 +400,18 @@ mod tests {
         let coord = coord_with_topic("events", 2).await;
         coord.join_group("g1", "m1", b"events", 30_000).await.unwrap();
 
-        // m2 joins → rebalance starts
         let (gen, _, _, _) = coord
             .join_group("g1", "m2", b"events", 30_000)
             .await
             .unwrap();
         assert_eq!(gen, 1);
 
-        // sync_group during rebalance → REBALANCE_IN_PROGRESS
         let err = coord.sync_group("g1", "m1").await.unwrap_err();
         assert!(matches!(err, BrokerError::RebalanceInProgress));
 
-        // Both members rejoin → rebalance finalizes
         coord.join_group("g1", "m1", b"events", 30_000).await.unwrap();
         coord.join_group("g1", "m2", b"events", 30_000).await.unwrap();
 
-        // Now sync should succeed and split partitions
         let a1: Vec<i32> =
             bincode::deserialize(&coord.sync_group("g1", "m1").await.unwrap()).unwrap();
         let a2: Vec<i32> =
@@ -445,14 +441,11 @@ mod tests {
         let coord = coord_with_topic("t", 2).await;
         coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
         coord.join_group("g1", "m2", b"t", 30_000).await.unwrap();
-        // Rejoin both to stabilize
         coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
         coord.join_group("g1", "m2", b"t", 30_000).await.unwrap();
 
-        // m2 leaves
         coord.leave_group("g1", "m2").await.unwrap();
 
-        // m1 rejoins to complete rebalance and pick up all partitions
         coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
         let assignment: Vec<i32> =
             bincode::deserialize(&coord.sync_group("g1", "m1").await.unwrap()).unwrap();
@@ -468,7 +461,6 @@ mod tests {
             bincode::deserialize(&coord.sync_group("g1", "m1").await.unwrap()).unwrap();
         assert_eq!(a, vec![0]);
 
-        // Topic grows to 3 partitions; trigger rebalance manually by having m1 rejoin
         coord.update_topic("t".to_string(), 3).await;
         coord.leave_group("g1", "m1").await.unwrap();
         coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
@@ -482,7 +474,6 @@ mod tests {
         let coord = coord_with_topic("t", 4).await;
         coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
         coord.join_group("g1", "m2", b"t", 30_000).await.unwrap();
-        // Both rejoin to finalize
         coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
         coord.join_group("g1", "m2", b"t", 30_000).await.unwrap();
 

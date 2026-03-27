@@ -1,7 +1,7 @@
 use crate::api::requests::BrokerGrpcRequest;
 use crate::api::responses::BrokerGrpcResponse;
-use crate::broker::core::BrokerCore;
-use crate::broker::storage::BrokerStorage;
+use crate::broker::server::core::BrokerCore;
+use crate::broker::storage::traits::BrokerStorage;
 
 pub struct BrokerRpcRouter<'a, S: BrokerStorage> {
     core: &'a BrokerCore<S>,

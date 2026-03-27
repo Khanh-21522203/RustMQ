@@ -1,20 +1,12 @@
 pub mod config;
-pub mod consumer_group_coordinator;
-pub mod controller_raft;
-pub mod controller_state_machine;
-pub mod controller_types;
-pub mod core;
+pub mod controller;
 pub mod error;
-pub mod isr_manager;
-pub mod kraft_broker;
-pub mod kafka_broker_server;
-pub mod partition_log;
-pub mod raft;
-pub mod raft_network;
+pub mod grpc;
+pub mod kraft;
 pub mod raft_transport;
-pub mod replication_manager;
-pub mod rpc_router;
 pub mod sbe_tcp;
-pub mod sled_storage;
-pub mod state_machine;
+pub mod server;
 pub mod storage;
+
+// PeerInfo is shared between both transports; re-export from broker root.
+pub use grpc::PeerInfo;

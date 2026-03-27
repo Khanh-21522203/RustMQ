@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-use crate::broker::partition_log::PartitionLog;
+use crate::broker::kraft::partition_log::PartitionLog;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 

@@ -5,6 +5,7 @@ pub mod metadata_cache;
 pub mod producer;
 
 // Re-export commonly used types
-pub use config::{AppConfig, BrokerConfig, ConsumerConfig, ProducerConfig};
+#[allow(unused_imports)]
+pub use config::{AppConfig, ConsumerConfig, ProducerConfig};
 pub use consumer::{ConsumedMessage, Consumer, MessageHandler};
-pub use producer::{Producer, ProducerMessage, ProducerResult};
+pub use producer::{Producer, ProducerMessage};

@@ -8,7 +8,7 @@
 /// - [`ControllerRaftNode`] — the Tokio task that drives the Raft loop.
 /// - [`ControllerStorage`]  — the cheaply-cloneable handle that callers use to
 ///   propose commands and read metadata.  Implements [`ControllerHandle`] from
-///   `kraft_broker.rs` so it can be passed directly to [`KRaftBroker`].
+///   `kraft/broker.rs` so it can be passed directly to [`KRaftBroker`].
 use async_trait::async_trait;
 use raft::eraftpb::{ConfChange, ConfChangeType, ConfState, EntryType, Message};
 use raft::{storage::MemStorage, Config, RawNode, StateRole};
@@ -22,10 +22,10 @@ use std::sync::{
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::broker::config::RaftConfig;
-use crate::broker::controller_state_machine::apply_controller_command;
-use crate::broker::controller_types::{BrokerRegistration, ControllerCommand, ControllerMetadata};
-use crate::broker::kraft_broker::ControllerHandle;
-use crate::broker::raft_network::{GrpcTransport, PeerInfo, RaftGrpcServer, RaftNetworkSender};
+use crate::broker::controller::state_machine::apply_controller_command;
+use crate::broker::controller::types::{ControllerCommand, ControllerMetadata};
+use crate::broker::kraft::broker::ControllerHandle;
+use crate::broker::grpc::{GrpcTransport, PeerInfo, RaftGrpcServer, RaftNetworkSender};
 use crate::broker::raft_transport::RaftTransport;
 
 // ── Internal proposal wrapper ─────────────────────────────────────────────────
@@ -549,7 +549,7 @@ impl ControllerHandle for ControllerStorage {
     async fn propose_mark_broker_dead(
         &self,
         broker_id: u64,
-        new_assignments: Vec<crate::broker::controller_types::PartitionAssignment>,
+        new_assignments: Vec<crate::broker::controller::types::PartitionAssignment>,
     ) -> anyhow::Result<()> {
         self.propose(ControllerCommand::MarkBrokerDead {
             broker_id,

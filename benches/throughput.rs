@@ -8,7 +8,8 @@
 /// - Different batch sizes
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rust_mq::broker::{
-    core::BrokerCore, kafka_broker_server::KafkaBrokerServer, storage::InMemoryStorage,
+    server::core::BrokerCore, server::kafka_server::KafkaBrokerServer,
+    storage::traits::InMemoryStorage,
 };
 use rust_mq::client::{
     ConsumedMessage, Consumer, ConsumerConfig, MessageHandler, Producer, ProducerConfig,
