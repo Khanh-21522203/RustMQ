@@ -113,6 +113,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
     }
 
     pub(crate) async fn handle_produce(&self, request: ProduceRequest) -> ProduceResponse {
+        let acks_all = request.required_acks == -1;
         let mut results = Vec::new();
         for topic_data in request.topics {
             let mut partition_results = Vec::new();
@@ -122,16 +123,26 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                 let mut error_code = 0i32;
                 let mut leader_addr = String::new();
                 for record in partition_data.records {
-                    match self
-                        .storage
-                        .produce_message(
-                            &topic_data.topic_name,
-                            partition_data.partition,
-                            record.key,
-                            record.value,
-                        )
-                        .await
-                    {
+                    let produce_result = if acks_all {
+                        self.storage
+                            .produce_message_acks_all(
+                                &topic_data.topic_name,
+                                partition_data.partition,
+                                record.key,
+                                record.value,
+                            )
+                            .await
+                    } else {
+                        self.storage
+                            .produce_message(
+                                &topic_data.topic_name,
+                                partition_data.partition,
+                                record.key,
+                                record.value,
+                            )
+                            .await
+                    };
+                    match produce_result {
                         Ok(offset) => {
                             last_offset = offset;
                         }

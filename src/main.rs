@@ -96,7 +96,6 @@ async fn run_broker(args: Args) -> Result<()> {
     use broker::config::BrokerConfig;
     use broker::core::BrokerCore;
     use broker::kafka_broker_server::KafkaBrokerServer;
-    use broker::multi_broker::MultiBroker;
     use broker::storage::InMemoryStorage;
     use tokio::sync::mpsc;
 
@@ -105,135 +104,11 @@ async fn run_broker(args: Args) -> Result<()> {
         let config = BrokerConfig::from_file(&config_path)?;
         if config.is_cluster_mode() {
             log::info!(
-                "Starting multi-broker node {} on API: {}",
+                "Starting KRaft broker node {} on API: {}",
                 config.node_id,
                 config.api_addr
             );
-
-            let cluster = config
-                .cluster
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Cluster config missing"))?;
-
-            // Build peer map: node_id -> PeerInfo for all cluster members.
-            // When join_addr is set this node is dynamically joining a running cluster;
-            // start with an empty conf so Raft doesn't elect us as a competing leader.
-            // The existing leader will replicate its log to us once it applies our AddNode
-            // ConfChange, at which point we'll adopt the full conf state via a snapshot.
-            use broker::raft_network::PeerInfo;
-            let peers: std::collections::HashMap<u64, PeerInfo> =
-                if config.join_addr.is_some() {
-                    std::collections::HashMap::new()
-                } else {
-                    cluster
-                        .initial_members
-                        .iter()
-                        .map(|m| {
-                            (
-                                m.node_id,
-                                PeerInfo {
-                                    rpc_addr: format!("http://{}", m.rpc_addr),
-                                    api_addr: m.api_addr.clone(),
-                                    sbe_tcp_addr: m.sbe_tcp_addr.clone(),
-                                },
-                            )
-                        })
-                        .collect()
-                };
-
-            let peer_count = peers.len();
-            let transport_kind = config.transport.clone();
-            let (multi_broker, raft_server) = MultiBroker::new(
-                config.node_id,
-                peers,
-                Some(config.storage_path.clone()),
-                Some(config.retention.clone()),
-                config.raft.clone(),
-                &transport_kind,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create multi-broker: {}", e))?;
-
-            log::info!(
-                "Multi-broker initialized with {} peers (transport={})",
-                peer_count,
-                transport_kind
-            );
-
-            let rpc_addr = config.rpc_addr.clone();
-            tokio::spawn(async move {
-                if let Err(e) = raft_server.serve(&rpc_addr).await {
-                    log::error!("Raft transport server error: {}", e);
-                }
-            });
-
-            let (rpc_tx, rpc_rx) = mpsc::channel(1000);
-            let broker_core = BrokerCore::new(rpc_rx, multi_broker);
-            tokio::spawn(async move {
-                broker_core.run().await;
-            });
-
-            let grpc_server = KafkaBrokerServer::new(rpc_tx);
-            let api_addr = config.api_addr.clone();
-            tokio::spawn(async move {
-                if let Err(e) = grpc_server.run(&api_addr).await {
-                    log::error!("Failed to start Kafka API server: {}", e);
-                }
-            });
-
-            log::info!("Raft broker started successfully on {}", config.api_addr);
-
-            // If join_addr is set, register this node with the existing cluster.
-            // We follow leader redirects (error_code == 6) and retry on transient failures.
-            if let Some(join_addr) = config.join_addr.clone() {
-                use crate::api::broker::AddNodeRequest;
-                use crate::client::kafka_broker_client::{KafkaBrokerClient, KafkaBrokerClientTrait};
-                let node_id = config.node_id;
-                let api_addr = config.api_addr.clone();
-                let rpc_addr = config.rpc_addr.clone();
-                tokio::spawn(async move {
-                    // Give the local gRPC server a moment to bind.
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                    let mut target = join_addr.clone();
-                    let max_attempts = 10u32;
-                    for attempt in 1..=max_attempts {
-                        match KafkaBrokerClient::new(&target).await.map_err(|e| e.to_string()) {
-                            Err(e) => {
-                                log::warn!("Attempt {}/{}: cannot connect to {}: {}", attempt, max_attempts, target, e);
-                            }
-                            Ok(client) => {
-                                let req = tonic::Request::new(AddNodeRequest {
-                                    node_id,
-                                    api_addr: api_addr.clone(),
-                                    rpc_addr: rpc_addr.clone(),
-                                });
-                                match client.add_node(req).await {
-                                    Ok(resp) if resp.error_code == 0 => {
-                                        log::info!("Successfully joined cluster via {}", target);
-                                        return;
-                                    }
-                                    Ok(resp) if resp.error_code == 6 && !resp.error_message.is_empty() => {
-                                        // Not the leader — redirect to the address in error_message.
-                                        log::info!("Redirecting AddNode to leader at {}", resp.error_message);
-                                        target = resp.error_message.clone();
-                                        // No back-off needed; the redirect is immediate.
-                                        continue;
-                                    }
-                                    Ok(resp) => {
-                                        log::warn!("Attempt {}/{}: AddNode rejected (code {}): {}", attempt, max_attempts, resp.error_code, resp.error_message);
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Attempt {}/{}: AddNode RPC failed: {}", attempt, max_attempts, e);
-                                    }
-                                }
-                            }
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                    log::error!("Failed to join cluster after {} attempts", max_attempts);
-                });
-            }
+            return run_kraft_cluster(config).await;
         } else if config.durable {
             // Single-node with sled-backed durable storage
             let (broker_host, broker_port) = parse_host_port(&config.api_addr);
@@ -324,6 +199,223 @@ async fn run_broker(args: Args) -> Result<()> {
     // Wait for shutdown signal
     signal::ctrl_c().await?;
     log::info!("Shutting down broker...");
+
+    Ok(())
+}
+
+async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
+    use broker::controller_raft::ControllerRaftNode;
+    use broker::core::BrokerCore;
+    use broker::kafka_broker_server::KafkaBrokerServer;
+    use broker::kraft_broker::{ControllerHandle, KRaftBroker};
+    use broker::raft_network::PeerInfo;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let cluster = config
+        .cluster
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Cluster config missing"))?;
+
+    // Build peer map. When join_addr is set start empty — the leader will
+    // replicate its log (including our AddNode ConfChange) once we join.
+    let peers: std::collections::HashMap<u64, PeerInfo> = if config.join_addr.is_some() {
+        std::collections::HashMap::new()
+    } else {
+        cluster
+            .initial_members
+            .iter()
+            .map(|m| {
+                (
+                    m.node_id,
+                    PeerInfo {
+                        rpc_addr: format!("http://{}", m.rpc_addr),
+                        api_addr: m.api_addr.clone(),
+                        sbe_tcp_addr: m.sbe_tcp_addr.clone(),
+                    },
+                )
+            })
+            .collect()
+    };
+
+    let rebalance_timeout_ms = config
+        .raft
+        .as_ref()
+        .map(|r| r.rebalance_timeout_ms)
+        .unwrap_or(broker::config::RaftConfig::default().rebalance_timeout_ms);
+
+    // Build ControllerRaftNode with the configured transport.
+    let controller_storage = if config.transport == "sbe_tcp" {
+        use broker::sbe_tcp::server::SbeTcpServer;
+        use broker::sbe_tcp::transport::SbeTcpTransport;
+
+        let peers_arc = Arc::new(std::sync::RwLock::new(peers));
+        let (step_tx, step_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sbe_server = SbeTcpServer::new(step_tx.clone());
+        let transport = SbeTcpTransport::new(config.node_id, peers_arc.clone());
+        let (ctrl_node, storage) = ControllerRaftNode::new_with_transport(
+            config.node_id,
+            peers_arc,
+            Some(config.storage_path.clone()),
+            Box::new(transport),
+            step_tx,
+            step_rx,
+            config.raft.clone(),
+            config.api_addr.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create KRaft controller: {:?}", e))?;
+        tokio::spawn(ctrl_node.run());
+        let rpc_addr = config.rpc_addr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sbe_server.serve(&rpc_addr).await {
+                log::error!("SBE-TCP KRaft server error: {}", e);
+            }
+        });
+        storage
+    } else {
+        // gRPC (default)
+        use broker::raft_network::{GrpcTransport, RaftGrpcServer, RaftNetworkSender};
+
+        let peers_arc = Arc::new(std::sync::RwLock::new(peers));
+        let (step_tx, step_rx) = tokio::sync::mpsc::unbounded_channel();
+        let grpc_server = RaftGrpcServer::new(step_tx.clone());
+        let transport = GrpcTransport(RaftNetworkSender::new(config.node_id, peers_arc.clone()));
+        let (ctrl_node, storage) = ControllerRaftNode::new_with_transport(
+            config.node_id,
+            peers_arc,
+            Some(config.storage_path.clone()),
+            Box::new(transport),
+            step_tx,
+            step_rx,
+            config.raft.clone(),
+            config.api_addr.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create KRaft controller: {:?}", e))?;
+        tokio::spawn(ctrl_node.run());
+        let rpc_addr = config.rpc_addr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = grpc_server.serve(&rpc_addr).await {
+                log::error!("gRPC KRaft server error: {}", e);
+            }
+        });
+        storage
+    };
+
+    // Separate sled DB for partition data (distinct from the controller's Raft state).
+    let data_path = format!("{}-kraft-data", config.storage_path);
+    let sled_db = Arc::new(
+        sled::open(&data_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open partition data store: {}", e))?,
+    );
+
+    let controller: Arc<dyn ControllerHandle> = Arc::new(controller_storage);
+    let node_id = config.node_id;
+    let broker = KRaftBroker::new(
+        node_id,
+        config.api_addr.clone(),
+        controller.clone(),
+        sled_db,
+        rebalance_timeout_ms,
+        1000, // isr_lag_max: follower may lag up to 1000 messages before leaving ISR
+    )
+    .await;
+
+    // ISR tick loop: every 500 ms recompute ISR and propose any changes.
+    let isr_mgr = broker.isr_mgr.clone();
+    let ctrl_isr = controller.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            let changes = isr_mgr.tick().await;
+            if changes.is_empty() {
+                continue;
+            }
+            let meta = ctrl_isr.metadata().await;
+            for change in changes {
+                let replicas = meta
+                    .partitions
+                    .get(&(change.topic.clone(), change.partition))
+                    .map(|p| p.replicas.clone())
+                    .unwrap_or_default();
+                if let Err(e) = ctrl_isr
+                    .propose_partition_change(
+                        change.topic,
+                        change.partition,
+                        node_id,
+                        change.new_isr,
+                        replicas,
+                    )
+                    .await
+                {
+                    log::warn!("ISR change propose failed: {}", e);
+                }
+            }
+        }
+    });
+
+    let (rpc_tx, rpc_rx) = mpsc::channel(1000);
+    let broker_core = BrokerCore::new(rpc_rx, broker);
+    tokio::spawn(async move {
+        broker_core.run().await;
+    });
+
+    let grpc_server = KafkaBrokerServer::new(rpc_tx);
+    let api_addr_str = config.api_addr.clone();
+    tokio::spawn(async move {
+        if let Err(e) = grpc_server.run(&api_addr_str).await {
+            log::error!("Failed to start KRaft API server: {}", e);
+        }
+    });
+
+    log::info!("KRaft broker {} started on {}", node_id, config.api_addr);
+
+    // If join_addr is set, register this node with the existing cluster.
+    // Follow NOT_LEADER redirects (error_code == 6) and retry on transient errors.
+    if let Some(join_addr) = config.join_addr.clone() {
+        use crate::api::broker::AddNodeRequest;
+        use crate::client::kafka_broker_client::{KafkaBrokerClient, KafkaBrokerClientTrait};
+        let api_addr = config.api_addr.clone();
+        let rpc_addr = config.rpc_addr.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let mut target = join_addr.clone();
+            let max_attempts = 10u32;
+            for attempt in 1..=max_attempts {
+                match KafkaBrokerClient::new(&target).await.map_err(|e| e.to_string()) {
+                    Err(e) => {
+                        log::warn!("Attempt {}/{}: cannot connect to {}: {}", attempt, max_attempts, target, e);
+                    }
+                    Ok(client) => {
+                        let req = tonic::Request::new(AddNodeRequest {
+                            node_id,
+                            api_addr: api_addr.clone(),
+                            rpc_addr: rpc_addr.clone(),
+                        });
+                        match client.add_node(req).await {
+                            Ok(resp) if resp.error_code == 0 => {
+                                log::info!("Successfully joined KRaft cluster via {}", target);
+                                return;
+                            }
+                            Ok(resp) if resp.error_code == 6 && !resp.error_message.is_empty() => {
+                                log::info!("Redirecting AddNode to controller at {}", resp.error_message);
+                                target = resp.error_message.clone();
+                                continue;
+                            }
+                            Ok(resp) => {
+                                log::warn!("Attempt {}/{}: AddNode rejected (code {}): {}", attempt, max_attempts, resp.error_code, resp.error_message);
+                            }
+                            Err(e) => {
+                                log::warn!("Attempt {}/{}: AddNode RPC failed: {}", attempt, max_attempts, e);
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            log::error!("Failed to join KRaft cluster after {} attempts", max_attempts);
+        });
+    }
 
     Ok(())
 }

@@ -127,6 +127,21 @@ pub trait BrokerStorage: Send + Sync {
         ))
     }
 
+    /// Produce a message and wait until it is fully replicated (acks=all).
+    ///
+    /// The default implementation delegates to `produce_message` without
+    /// waiting for replication — suitable for single-node and in-memory
+    /// backends where there are no followers.
+    async fn produce_message_acks_all(
+        &self,
+        topic: &str,
+        partition: i32,
+        key: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> BrokerResult<i64> {
+        self.produce_message(topic, partition, key, value).await
+    }
+
     /// Propose removing a node from the Raft cluster.
     /// Returns an error in single-node mode.
     async fn remove_node(&self, _node_id: u64) -> BrokerResult<()> {
