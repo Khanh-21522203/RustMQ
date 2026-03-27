@@ -1,10 +1,11 @@
-node_id: 1
+node_id: 2
 api_addr: "0.0.0.0:9092"
 rpc_addr: "0.0.0.0:19092"
-storage_path: "/data/broker-1"
+storage_path: "/data/broker-2"
+transport: "grpc"
 
 cluster:
-  bootstrap: true
+  bootstrap: false
   initial_members:
     - node_id: 1
       api_addr: "broker-1:9092"
@@ -22,5 +23,7 @@ raft:
   election_timeout_max_ms: 3000
   snapshot_threshold: 10000
   rebalance_timeout_ms: 30000
+
+default_replication_factor: 3
 
 log_level: "debug"

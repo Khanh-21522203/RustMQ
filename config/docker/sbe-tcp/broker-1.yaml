@@ -24,4 +24,6 @@ raft:
   snapshot_threshold: 10000
   rebalance_timeout_ms: 30000
 
+default_replication_factor: 3
+
 log_level: "debug"

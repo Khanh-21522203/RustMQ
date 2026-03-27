@@ -24,7 +24,7 @@ use tokio::time::{sleep, Duration};
 /// Override with BROKER_ADDR env var to target an external cluster, e.g.:
 ///   BROKER_ADDR=http://localhost:9092 cargo run --example benchmark
 fn broker_addr() -> String {
-    std::env::var("BROKER_ADDR").unwrap_or_else(|_| broker_addr().as_str().to_string())
+    std::env::var("BROKER_ADDR").unwrap_or_else(|_| "http://localhost:50051".to_string())
 }
 
 struct BenchmarkHandler {

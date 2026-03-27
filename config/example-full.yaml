@@ -1,34 +1,49 @@
-# Full Configuration Example
-# This file shows all available configuration options
+# Full BrokerConfig example — shows all available fields with descriptions
 
-broker:
-  # Broker address
-  address: "http://localhost:50051"
-  
-  # Connection timeout in seconds
-  timeout_secs: 30
-  
-  # Maximum retries for failed operations
-  max_retries: 3
+# Node identity
+node_id: 1
+api_addr: "127.0.0.1:9092"      # Client-facing gRPC address
+rpc_addr: "127.0.0.1:19092"     # Raft inter-node RPC address
+storage_path: "./data/broker-1" # Sled storage path for Raft logs + partition data
 
-producer:
-  topic: "my-topic"
-  partition: 0
-  partitioning: "fixed"
-  num_partitions: 1
-  required_acks: 1
-  timeout_ms: 5000
-  batch_size: 100
-  flush_interval_ms: 100
+# Inter-broker Raft transport: "grpc" (default) or "sbe_tcp"
+transport: "grpc"
 
-consumer:
-  topic: "my-topic"
-  partitions: [0]
-  group_id: "consumer-group-1"
-  offset: -2
-  max_bytes: 1048576
-  max_wait_ms: 1000
-  min_bytes: 1
-  auto_commit: true
-  auto_commit_interval_ms: 5000
-  poll_interval_ms: 1000
+# Default replication factor for newly created topics.
+# Clamped to the number of live brokers if higher.
+default_replication_factor: 3
+
+# Set to the api_addr of an existing cluster node to join dynamically.
+# When absent, the node uses initial_members for bootstrapping.
+# join_addr: "127.0.0.1:9092"
+
+# Cluster configuration
+cluster:
+  bootstrap: true   # Set true on exactly one node when forming a new cluster
+  initial_members:
+    - node_id: 1
+      api_addr: "127.0.0.1:9092"
+      rpc_addr: "127.0.0.1:19092"
+      # sbe_tcp_addr: "127.0.0.1:29092"  # Only needed when transport = "sbe_tcp"
+    - node_id: 2
+      api_addr: "127.0.0.1:9093"
+      rpc_addr: "127.0.0.1:19093"
+    - node_id: 3
+      api_addr: "127.0.0.1:9094"
+      rpc_addr: "127.0.0.1:19094"
+
+# Raft tuning
+raft:
+  heartbeat_interval_ms: 1000
+  election_timeout_min_ms: 3000
+  election_timeout_max_ms: 6000
+  snapshot_threshold: 10000       # Compact Raft log after this many entries
+  rebalance_timeout_ms: 30000     # Wait this long for members to rejoin before forcing rebalance
+
+# Message retention (optional — omit for unlimited)
+retention:
+  retention_ms: 604800000         # 7 days in milliseconds
+  max_messages_per_partition: 1000000
+
+# Logging
+log_level: "info"   # trace | debug | info | warn | error

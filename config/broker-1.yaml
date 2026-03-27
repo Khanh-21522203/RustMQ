@@ -28,5 +28,7 @@ raft:
   election_timeout_max_ms: 6000
   snapshot_threshold: 10000
 
+default_replication_factor: 3
+
 # Logging
 log_level: "info"
