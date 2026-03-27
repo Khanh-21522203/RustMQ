@@ -317,6 +317,7 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
         sled_db,
         rebalance_timeout_ms,
         1000, // isr_lag_max: follower may lag up to 1000 messages before leaving ISR
+        config.default_replication_factor,
     )
     .await;
 

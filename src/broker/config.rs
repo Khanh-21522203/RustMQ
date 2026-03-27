@@ -48,6 +48,11 @@ pub struct BrokerConfig {
     /// When set, this node sends an AddNode RPC to that address after startup.
     #[serde(default)]
     pub join_addr: Option<String>,
+
+    /// Default replication factor for newly created topics.
+    /// Must be <= the number of live brokers; clamped automatically otherwise.
+    #[serde(default = "default_replication_factor")]
+    pub default_replication_factor: u16,
 }
 
 /// Cluster configuration
@@ -146,6 +151,10 @@ fn default_transport() -> String {
     "grpc".to_string()
 }
 
+fn default_replication_factor() -> u16 {
+    1
+}
+
 impl BrokerConfig {
     /// Load configuration from a YAML file
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
@@ -168,6 +177,7 @@ impl BrokerConfig {
             transport: default_transport(),
             durable: false,
             join_addr: None,
+            default_replication_factor: default_replication_factor(),
         }
     }
 

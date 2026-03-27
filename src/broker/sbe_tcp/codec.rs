@@ -295,7 +295,7 @@ fn read_bytes<'a>(src: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raft::eraftpb::{Entry, EntryType, MessageType};
+    use raft::eraftpb::{ConfState, Entry, EntryType, MessageType, Snapshot, SnapshotMetadata};
 
     fn round_trip(msg: Message) -> Message {
         let mut buf = BytesMut::new();
@@ -399,5 +399,265 @@ mod tests {
 
         let out = round_trip(msg);
         assert!(out.snapshot.map_or(true, |s| s.is_empty()));
+    }
+
+    #[test]
+    fn append_response_round_trip() {
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgAppendResponse as i32;
+        msg.to = 1;
+        msg.from = 2;
+        msg.term = 4;
+        msg.index = 55;
+        msg.reject = true;
+        msg.reject_hint = 50;
+        msg.log_term = 3;
+
+        let out = round_trip(msg.clone());
+        assert_eq!(out.msg_type, MessageType::MsgAppendResponse as i32);
+        assert_eq!(out.index, 55);
+        assert_eq!(out.reject, true);
+        assert_eq!(out.reject_hint, 50);
+        assert_eq!(out.log_term, 3);
+    }
+
+    #[test]
+    fn heartbeat_response_round_trip() {
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgHeartbeatResponse as i32;
+        msg.to = 1;
+        msg.from = 3;
+        msg.term = 7;
+        msg.commit = 100;
+        msg.context = b"read-ctx".to_vec();
+
+        let out = round_trip(msg.clone());
+        assert_eq!(out.msg_type, MessageType::MsgHeartbeatResponse as i32);
+        assert_eq!(out.commit, 100);
+        assert_eq!(out.context, b"read-ctx");
+    }
+
+    #[test]
+    fn pre_vote_round_trip() {
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgRequestPreVote as i32;
+        msg.to = 2;
+        msg.from = 1;
+        msg.term = 11;
+        msg.log_term = 10;
+        msg.index = 200;
+
+        let out = round_trip(msg.clone());
+        assert_eq!(out.msg_type, MessageType::MsgRequestPreVote as i32);
+        assert_eq!(out.term, 11);
+        assert_eq!(out.log_term, 10);
+        assert_eq!(out.index, 200);
+    }
+
+    #[test]
+    fn pre_vote_response_round_trip() {
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgRequestPreVoteResponse as i32;
+        msg.to = 1;
+        msg.from = 2;
+        msg.term = 11;
+        msg.reject = false; // granted
+
+        let out = round_trip(msg.clone());
+        assert_eq!(out.msg_type, MessageType::MsgRequestPreVoteResponse as i32);
+        assert_eq!(out.reject, false);
+
+        // Also test rejected pre-vote
+        let mut msg2 = msg.clone();
+        msg2.reject = true;
+        msg2.reject_hint = 9;
+        let out2 = round_trip(msg2);
+        assert_eq!(out2.reject, true);
+        assert_eq!(out2.reject_hint, 9);
+    }
+
+    #[test]
+    fn snapshot_with_data_round_trip() {
+        let mut meta = SnapshotMetadata::default();
+        meta.index = 500;
+        meta.term = 8;
+        let mut cs = ConfState::default();
+        cs.voters = vec![1, 2, 3];
+        meta.conf_state = Some(cs).into();
+
+        let mut snap = Snapshot::default();
+        snap.data = b"snapshot-payload-bytes".to_vec();
+        snap.metadata = Some(meta).into();
+
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgSnapshot as i32;
+        msg.to = 2;
+        msg.from = 1;
+        msg.term = 8;
+        msg.snapshot = Some(snap).into();
+
+        let out = round_trip(msg);
+        assert_eq!(out.msg_type, MessageType::MsgSnapshot as i32);
+        let out_snap = out.snapshot.unwrap();
+        assert_eq!(out_snap.data, b"snapshot-payload-bytes");
+        let out_meta = out_snap.metadata.unwrap();
+        assert_eq!(out_meta.index, 500);
+        assert_eq!(out_meta.term, 8);
+        assert_eq!(out_meta.conf_state.unwrap().voters, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn timeout_now_round_trip() {
+        // MsgTimeoutNow: sent by leader to trigger immediate election on target
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgTimeoutNow as i32;
+        msg.to = 2;
+        msg.from = 1;
+        msg.term = 6;
+
+        let out = round_trip(msg.clone());
+        assert_eq!(out.msg_type, MessageType::MsgTimeoutNow as i32);
+        assert_eq!(out.to, 2);
+        assert_eq!(out.term, 6);
+    }
+
+    #[test]
+    fn transfer_leader_round_trip() {
+        // MsgTransferLeader: client asks leader to transfer leadership to node
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgTransferLeader as i32;
+        msg.to = 1; // current leader
+        msg.from = 2; // target node
+        msg.term = 6;
+
+        let out = round_trip(msg.clone());
+        assert_eq!(out.msg_type, MessageType::MsgTransferLeader as i32);
+        assert_eq!(out.from, 2);
+    }
+
+    #[test]
+    fn read_index_round_trip() {
+        // MsgReadIndex carries the read request ID in context
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgReadIndex as i32;
+        msg.to = 1;
+        msg.from = 2;
+        msg.term = 5;
+        msg.context = b"read-req-id-001".to_vec();
+
+        let out = round_trip(msg.clone());
+        assert_eq!(out.msg_type, MessageType::MsgReadIndex as i32);
+        assert_eq!(out.context, b"read-req-id-001");
+    }
+
+    #[test]
+    fn read_index_resp_round_trip() {
+        // MsgReadIndexResp carries the confirmed index + original request context
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgReadIndexResp as i32;
+        msg.to = 2;
+        msg.from = 1;
+        msg.term = 5;
+        msg.index = 300; // confirmed safe-read index
+        msg.context = b"read-req-id-001".to_vec();
+
+        let out = round_trip(msg.clone());
+        assert_eq!(out.msg_type, MessageType::MsgReadIndexResp as i32);
+        assert_eq!(out.index, 300);
+        assert_eq!(out.context, b"read-req-id-001");
+    }
+
+    #[test]
+    fn propose_with_conf_change_entry_round_trip() {
+        // MsgPropose with a ConfChange entry (as sent during AddNode/RemoveNode)
+        let mut entry = Entry::default();
+        entry.entry_type = EntryType::EntryConfChange as i32;
+        entry.term = 3;
+        entry.index = 42;
+        entry.data = b"conf-change-payload".to_vec();
+        entry.context = b"cc-ctx".to_vec();
+
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgPropose as i32;
+        msg.to = 1;
+        msg.from = 0; // local propose (from = 0 means local)
+        msg.term = 3;
+        msg.entries = vec![entry];
+
+        let out = round_trip(msg);
+        assert_eq!(out.msg_type, MessageType::MsgPropose as i32);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].entry_type, EntryType::EntryConfChange as i32);
+        assert_eq!(out.entries[0].data, b"conf-change-payload");
+        assert_eq!(out.entries[0].context, b"cc-ctx");
+    }
+
+    #[test]
+    fn hup_beat_check_quorum_round_trip() {
+        // Local trigger messages — minimal fields, exercising the zero-value path
+        for msg_type in [
+            MessageType::MsgHup,
+            MessageType::MsgBeat,
+            MessageType::MsgCheckQuorum,
+        ] {
+            let mut msg = Message::default();
+            msg.msg_type = msg_type as i32;
+            msg.from = 1;
+            msg.term = 2;
+
+            let out = round_trip(msg.clone());
+            assert_eq!(out.msg_type, msg_type as i32, "failed for {:?}", msg_type);
+            assert_eq!(out.from, 1);
+            assert_eq!(out.term, 2);
+            assert!(out.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn snap_status_unreachable_round_trip() {
+        // MsgSnapStatus and MsgUnreachable: notify leader about follower state
+        for msg_type in [MessageType::MsgSnapStatus, MessageType::MsgUnreachable] {
+            let mut msg = Message::default();
+            msg.msg_type = msg_type as i32;
+            msg.to = 1;
+            msg.from = 3;
+            msg.reject = true; // snap failed / node unreachable
+
+            let out = round_trip(msg.clone());
+            assert_eq!(out.msg_type, msg_type as i32, "failed for {:?}", msg_type);
+            assert_eq!(out.from, 3);
+            assert_eq!(out.reject, true);
+        }
+    }
+
+    #[test]
+    fn all_scalar_fields_preserved() {
+        // Single test that every scalar field survives a round-trip without loss.
+        let mut msg = Message::default();
+        msg.msg_type = MessageType::MsgAppend as i32;
+        msg.to = 0xDEAD_BEEF_0001u64;
+        msg.from = 0xDEAD_BEEF_0002u64;
+        msg.term = 0xDEAD_BEEF_0003u64;
+        msg.log_term = 0xDEAD_BEEF_0004u64;
+        msg.index = 0xDEAD_BEEF_0005u64;
+        msg.commit = 0xDEAD_BEEF_0006u64;
+        msg.commit_term = 0xDEAD_BEEF_0007u64;
+        msg.request_snapshot = 0xDEAD_BEEF_0008u64;
+        msg.reject = true;
+        msg.reject_hint = 0xDEAD_BEEF_0009u64;
+        msg.priority = -9999;
+
+        let out = round_trip(msg.clone());
+        assert_eq!(out.to, msg.to);
+        assert_eq!(out.from, msg.from);
+        assert_eq!(out.term, msg.term);
+        assert_eq!(out.log_term, msg.log_term);
+        assert_eq!(out.index, msg.index);
+        assert_eq!(out.commit, msg.commit);
+        assert_eq!(out.commit_term, msg.commit_term);
+        assert_eq!(out.request_snapshot, msg.request_snapshot);
+        assert_eq!(out.reject, true);
+        assert_eq!(out.reject_hint, msg.reject_hint);
+        assert_eq!(out.priority, -9999);
     }
 }

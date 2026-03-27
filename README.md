@@ -26,7 +26,7 @@ Rust-MQ supports two deployment modes:
 - **Single Broker**: Simple in-memory storage for development and testing
 - **Multi-Broker Cluster**: Distributed system with Raft consensus for production
 
-See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation with diagrams.  
+See [docs/architecture.md](docs1/architecture.md) for detailed architecture documentation with diagrams.  
 
 ## Quick Start
 

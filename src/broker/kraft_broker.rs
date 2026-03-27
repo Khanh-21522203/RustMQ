@@ -92,6 +92,8 @@ pub struct KRaftBroker {
     pub replication_mgr: Arc<ReplicationManager>,
     pub isr_mgr: Arc<IsrManager>,
     sled_db: Arc<sled::Db>,
+    /// Default replication factor for newly created topics.
+    replication_factor: u16,
 }
 
 impl KRaftBroker {
@@ -103,6 +105,7 @@ impl KRaftBroker {
         sled_db: Arc<sled::Db>,
         rebalance_timeout_ms: i64,
         isr_lag_max: i64,
+        replication_factor: u16,
     ) -> Self {
         let isr_mgr = Arc::new(IsrManager::new(node_id, isr_lag_max, 30_000));
         let broker = Self {
@@ -117,6 +120,7 @@ impl KRaftBroker {
             replication_mgr: Arc::new(ReplicationManager::new()),
             isr_mgr,
             sled_db,
+            replication_factor,
         };
         broker.sync_partitions_from_metadata().await;
         broker
@@ -206,29 +210,54 @@ impl BrokerStorage for KRaftBroker {
             ));
         }
 
+        let rf = self.replication_factor;
+
         self.controller
-            .propose_create_topic(topic.to_string(), num_partitions, 1)
+            .propose_create_topic(topic.to_string(), num_partitions, rf)
             .await
             .map_err(BrokerError::from)?;
 
-        // Auto-assign all partitions to this node when we are the controller
-        // (single-broker or first-boot combined mode).
+        // Only the active controller assigns replicas.
         if self.controller.is_controller() {
+            // Collect alive broker IDs sorted for deterministic assignment.
+            let meta = self.controller.metadata().await;
+            let mut broker_ids: Vec<u64> = meta.brokers.keys().copied().collect();
+            broker_ids.sort();
+
+            // Fall back to this node when no brokers are registered yet
+            // (e.g. first-boot single-node before any RegisterBroker is applied).
+            if broker_ids.is_empty() {
+                broker_ids.push(self.node_id);
+            }
+
+            let n = broker_ids.len();
+            // Clamp rf to the number of available brokers.
+            let effective_rf = (rf as usize).min(n);
+
             for p in 0..num_partitions {
+                // Round-robin: start offset shifts by 1 per partition.
+                let start = (p as usize) % n;
+                let replicas: Vec<u64> = (0..effective_rf)
+                    .map(|i| broker_ids[(start + i) % n])
+                    .collect();
+                let leader = replicas[0];
+                // Initial ISR = all replicas (they start fully in-sync).
+                let isr = replicas.clone();
+
                 self.controller
                     .propose_partition_change(
                         topic.to_string(),
                         p,
-                        self.node_id,
-                        vec![self.node_id],
-                        vec![self.node_id],
+                        leader,
+                        isr,
+                        replicas,
                     )
                     .await
                     .map_err(BrokerError::from)?;
             }
         }
 
-        // Open logs and register with IsrManager for partitions we now lead.
+        // Open logs and register with IsrManager for partitions this node leads.
         let meta = self.controller.metadata().await;
         for p in 0..num_partitions {
             let pr = meta.partitions.get(&(topic.to_string(), p));
@@ -686,6 +715,7 @@ mod tests {
             db,
             30_000,
             1_000,
+            1,
         )
         .await;
         (broker, ctrl)
@@ -706,6 +736,7 @@ mod tests {
             db,
             30_000,
             1_000,
+            1,
         )
         .await;
         (broker, ctrl)
@@ -735,6 +766,92 @@ mod tests {
         let (broker, _) = make_broker(1).await;
         let err = broker.create_topic("t", 0).await.unwrap_err();
         assert!(matches!(err, BrokerError::Validation(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_topic_round_robin_assignment() {
+        // 3 brokers registered, rf=2, 6 partitions.
+        // Expected assignment (start = p % 3):
+        //   p0: brokers [1,2], leader=1
+        //   p1: brokers [2,3], leader=2
+        //   p2: brokers [3,1], leader=3
+        //   p3: brokers [1,2], leader=1
+        //   p4: brokers [2,3], leader=2
+        //   p5: brokers [3,1], leader=3
+        let ctrl = MockController::new(1, "127.0.0.1:9092");
+        // Register brokers 1, 2, 3.
+        for id in [1u64, 2, 3] {
+            ctrl.meta.write().await.brokers.insert(
+                id,
+                BrokerRegistration {
+                    broker_id: id,
+                    api_addr: format!("127.0.0.1:{}", 9000 + id),
+                    rpc_addr: format!("127.0.0.1:{}", 9100 + id),
+                    last_seen_ms: 0,
+                },
+            );
+        }
+        let db = Arc::new(sled::Config::new().temporary(true).open().unwrap());
+        let broker = KRaftBroker::new(
+            1,
+            "127.0.0.1:9092".to_string(),
+            ctrl.clone(),
+            db,
+            30_000,
+            1_000,
+            2, // replication_factor = 2
+        )
+        .await;
+
+        broker.create_topic("t", 6).await.unwrap();
+
+        let meta = ctrl.metadata().await;
+        let expected_leaders = [1u64, 2, 3, 1, 2, 3];
+        let expected_replicas: &[&[u64]] = &[
+            &[1, 2], &[2, 3], &[3, 1], &[1, 2], &[2, 3], &[3, 1],
+        ];
+        for p in 0..6i32 {
+            let pr = meta.partitions.get(&("t".to_string(), p)).unwrap();
+            assert_eq!(pr.leader, expected_leaders[p as usize], "p{} leader", p);
+            assert_eq!(&pr.replicas, expected_replicas[p as usize], "p{} replicas", p);
+            assert_eq!(&pr.isr, expected_replicas[p as usize], "p{} isr", p);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_topic_rf_clamped_to_broker_count() {
+        // rf=3 but only 2 brokers — each partition should get 2 replicas.
+        let ctrl = MockController::new(1, "127.0.0.1:9092");
+        for id in [1u64, 2] {
+            ctrl.meta.write().await.brokers.insert(
+                id,
+                BrokerRegistration {
+                    broker_id: id,
+                    api_addr: format!("127.0.0.1:{}", 9000 + id),
+                    rpc_addr: format!("127.0.0.1:{}", 9100 + id),
+                    last_seen_ms: 0,
+                },
+            );
+        }
+        let db = Arc::new(sled::Config::new().temporary(true).open().unwrap());
+        let broker = KRaftBroker::new(
+            1,
+            "127.0.0.1:9092".to_string(),
+            ctrl.clone(),
+            db,
+            30_000,
+            1_000,
+            3, // rf=3 > 2 brokers → clamped to 2
+        )
+        .await;
+
+        broker.create_topic("t", 2).await.unwrap();
+
+        let meta = ctrl.metadata().await;
+        for p in 0..2i32 {
+            let pr = meta.partitions.get(&("t".to_string(), p)).unwrap();
+            assert_eq!(pr.replicas.len(), 2, "p{} should have 2 replicas", p);
+        }
     }
 
     // ── Produce / fetch tests ─────────────────────────────────────────────────
@@ -811,6 +928,7 @@ mod tests {
             db,
             30_000,
             1_000,
+            1,
         )
         .await;
 
@@ -935,7 +1053,7 @@ mod tests {
             );
         }
         let db = Arc::new(sled::Config::new().temporary(true).open().unwrap());
-        let broker = KRaftBroker::new(1, "127.0.0.1:9092".to_string(), ctrl, db, 30_000, 1_000)
+        let broker = KRaftBroker::new(1, "127.0.0.1:9092".to_string(), ctrl, db, 30_000, 1_000, 1)
             .await;
 
         let meta = broker.get_cluster_metadata().await;
