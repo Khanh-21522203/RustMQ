@@ -1,6 +1,7 @@
 pub mod config;
 pub mod consumer;
 pub mod kafka_broker_client;
+pub mod metadata_cache;
 pub mod producer;
 
 // Re-export commonly used types

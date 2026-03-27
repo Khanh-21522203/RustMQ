@@ -40,6 +40,22 @@ pub struct BrokerRegistration {
     pub api_addr: String,
     /// Inter-broker RPC address e.g. "127.0.0.1:9093"
     pub rpc_addr: String,
+    /// Wall-clock ms of the last heartbeat seen from this broker (0 = never seen).
+    #[serde(default)]
+    pub last_seen_ms: u64,
+}
+
+/// Carries a single partition reassignment computed by the failure detector.
+/// Passed inside `ControllerCommand::MarkBrokerDead` so the state machine only
+/// applies data and makes no topology decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionAssignment {
+    pub topic: String,
+    pub partition: i32,
+    /// New leader node ID; 0 means the partition is OFFLINE (ISR exhausted).
+    pub new_leader: u64,
+    pub new_isr: Vec<u64>,
+    pub replicas: Vec<u64>,
 }
 
 /// Commands written into the controller Raft log.
@@ -71,4 +87,18 @@ pub enum ControllerCommand {
         broker_id: u64,
     },
     BumpControllerEpoch,
+    /// Broker-side heartbeat: update `last_seen_ms` in the broker registry.
+    /// `timestamp_ms` is captured at proposal time (not inside apply) for
+    /// Raft determinism.
+    BrokerHeartbeat {
+        broker_id: u64,
+        timestamp_ms: u64,
+    },
+    /// Declare a broker dead and atomically apply all resulting partition
+    /// reassignments.  The pre-computed assignments are carried in the command
+    /// so the state machine stays pure (no topology logic inside apply).
+    MarkBrokerDead {
+        broker_id: u64,
+        new_assignments: Vec<PartitionAssignment>,
+    },
 }

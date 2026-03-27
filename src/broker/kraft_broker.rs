@@ -57,6 +57,22 @@ pub trait ControllerHandle: Send + Sync {
     ) -> anyhow::Result<()>;
 
     async fn propose_remove_node(&self, node_id: u64) -> anyhow::Result<()>;
+
+    /// Propose a heartbeat timestamp for `broker_id`.
+    /// `timestamp_ms` must be captured at call site (not inside apply) for
+    /// Raft determinism.
+    async fn propose_broker_heartbeat(
+        &self,
+        broker_id: u64,
+        timestamp_ms: u64,
+    ) -> anyhow::Result<()>;
+
+    /// Declare `broker_id` dead and atomically apply `new_assignments`.
+    async fn propose_mark_broker_dead(
+        &self,
+        broker_id: u64,
+        new_assignments: Vec<crate::broker::controller_types::PartitionAssignment>,
+    ) -> anyhow::Result<()>;
 }
 
 // ── KRaftBroker ───────────────────────────────────────────────────────────────
@@ -620,6 +636,7 @@ mod tests {
                     broker_id: node_id,
                     api_addr,
                     rpc_addr,
+                    last_seen_ms: 0,
                 },
             );
             Ok(())
@@ -627,6 +644,32 @@ mod tests {
 
         async fn propose_remove_node(&self, node_id: u64) -> anyhow::Result<()> {
             self.meta.write().await.brokers.remove(&node_id);
+            Ok(())
+        }
+
+        async fn propose_broker_heartbeat(
+            &self,
+            _broker_id: u64,
+            _timestamp_ms: u64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn propose_mark_broker_dead(
+            &self,
+            broker_id: u64,
+            new_assignments: Vec<crate::broker::controller_types::PartitionAssignment>,
+        ) -> anyhow::Result<()> {
+            use crate::broker::controller_state_machine::apply_controller_command;
+            use crate::broker::controller_types::ControllerCommand;
+            let mut meta = self.meta.write().await;
+            apply_controller_command(
+                &mut meta,
+                ControllerCommand::MarkBrokerDead {
+                    broker_id,
+                    new_assignments,
+                },
+            );
             Ok(())
         }
     }
@@ -756,6 +799,7 @@ mod tests {
                     broker_id: 2,
                     api_addr: "127.0.0.1:9094".to_string(),
                     rpc_addr: "127.0.0.1:9095".to_string(),
+                    last_seen_ms: 0,
                 },
             );
         }

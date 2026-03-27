@@ -534,6 +534,30 @@ impl ControllerHandle for ControllerStorage {
             .map_err(|e| anyhow::anyhow!("reply closed: {}", e))?
     }
 
+    async fn propose_broker_heartbeat(
+        &self,
+        broker_id: u64,
+        timestamp_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.propose(ControllerCommand::BrokerHeartbeat {
+            broker_id,
+            timestamp_ms,
+        })
+        .await
+    }
+
+    async fn propose_mark_broker_dead(
+        &self,
+        broker_id: u64,
+        new_assignments: Vec<crate::broker::controller_types::PartitionAssignment>,
+    ) -> anyhow::Result<()> {
+        self.propose(ControllerCommand::MarkBrokerDead {
+            broker_id,
+            new_assignments,
+        })
+        .await
+    }
+
     async fn propose_remove_node(&self, node_id: u64) -> anyhow::Result<()> {
         if !self.is_controller() {
             let addr = self.leader_api_addr().unwrap_or_default();

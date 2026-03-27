@@ -354,6 +354,71 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
         }
     });
 
+    // Heartbeat task: propose a timestamp every 3 s so the controller knows
+    // this broker is alive.  NOT_LEADER is normal on non-leader nodes.
+    {
+        let ctrl_hb = controller.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                interval.tick().await;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if let Err(e) = ctrl_hb.propose_broker_heartbeat(node_id, ts).await {
+                    // NOT_LEADER is expected on follower nodes; only warn on other errors.
+                    if !e.to_string().contains("NOT_LEADER") {
+                        log::warn!("Broker heartbeat propose failed: {}", e);
+                    } else {
+                        log::debug!("Broker heartbeat skipped (not leader): {}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    // Failure detector task: runs only on the active controller (leader).
+    // Every 5 s scan brokers; declare dead if last_seen_ms > 0 and gap > 15 s.
+    {
+        use broker::controller_state_machine::compute_failover_assignments;
+        let ctrl_fd = controller.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if !ctrl_fd.is_controller() {
+                    continue;
+                }
+                let meta = ctrl_fd.metadata().await;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                for (broker_id, reg) in &meta.brokers {
+                    // Grace period: skip brokers that have never sent a heartbeat.
+                    if reg.last_seen_ms == 0 {
+                        continue;
+                    }
+                    if now_ms.saturating_sub(reg.last_seen_ms) > 15_000 {
+                        log::warn!(
+                            "Broker {} appears dead (last_seen {}ms ago); electing new leaders",
+                            broker_id,
+                            now_ms - reg.last_seen_ms
+                        );
+                        let assignments = compute_failover_assignments(&meta, *broker_id);
+                        if let Err(e) = ctrl_fd
+                            .propose_mark_broker_dead(*broker_id, assignments)
+                            .await
+                        {
+                            log::error!("propose_mark_broker_dead failed: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let (rpc_tx, rpc_rx) = mpsc::channel(1000);
     let broker_core = BrokerCore::new(rpc_rx, broker);
     tokio::spawn(async move {
