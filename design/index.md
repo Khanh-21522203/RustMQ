@@ -1,6 +1,30 @@
-# RustMQ - Design Index
+# RustMQ — Design Index
 
-RustMQ is a Rust-based message-queue system that runs as a single binary in broker, producer, or consumer mode. The runtime combines a Kafka-like client gRPC API, a KRaft-style metadata controller path, and pluggable Raft transports (gRPC or SBE-over-TCP), with client libraries and CLI tooling in the same repository.
+RustMQ is a Rust message-queue system that runs as a single binary in broker, producer, or consumer mode, with a Kafka-like gRPC API for data/control operations, a KRaft-style controller path for metadata replication, and pluggable Raft transport implementations (gRPC and SBE-over-TCP).
+
+## Mental Map
+
+┌─ Client Runtime ────────────────────────────────────────────────────────────┐  ┌─ Broker API/Data Path ─────────────────────────────────────────────────────┐
+│ Owns: CLI mode boot, producer/consumer runtime loops, client config/cache   │  │ Owns: Kafka RPC ingress, topic metadata/create, produce/fetch/list-offsets │
+│ Entry: src/main.rs                                                          │  │ Entry: src/broker/server/kafka_server.rs                                   │
+│ Key:   src/client/producer.rs, src/client/consumer.rs, src/client/config.rs │  │ Key:   src/broker/server/rpc_router.rs, src/broker/server/core.rs          │
+│ Uses:  Broker API/Data Path, Cluster & Controller                           │  │ Uses:  Cluster & Controller, Group Coordination                            │
+└─────────────────────────────────────────────────────────────────────────────┘  └────────────────────────────────────────────────────────────────────────────┘
+
+┌─ Group Coordination ────────────────────────────────────────────────────────┐  ┌─ Cluster & Controller ────────────────────────────────────────────────────────────┐
+│ Owns: group membership, rebalance, assignment, heartbeat/leave semantics    │  │ Owns: node join/remove, controller command proposal/apply, liveness checks        │
+│ Entry: src/broker/server/consumer_group.rs                                  │  │ Entry: src/main.rs (run_kraft_cluster)                                            │
+│ Key:   src/broker/storage/traits.rs, src/api/kafka.proto                    │  │ Key:   src/broker/controller/raft_node.rs, src/broker/controller/state_machine.rs │
+│ Uses:  Broker API/Data Path, Shared                                         │  │ Uses:  Replication & Transport, Shared                                            │
+└─────────────────────────────────────────────────────────────────────────────┘  └───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ Replication & Transport ───────────────────────────────────────────────────┐  ┌─ Shared ──────────────────────────────────────────────────────────────────────┐
+│ Owns: partition log, ISR/HW reconciliation, follower fetch, Raft transport  │  │ Owns: broker config contract, API proto/contracts, envelope codec, ops refs   │
+│ Entry: src/broker/kraft/broker.rs                                           │  │ Key:   src/broker/config.rs, src/api/kafka.proto, src/codec.rs, examples/*.rs │
+│ Key:   src/broker/kraft/partition_log.rs, src/broker/kraft/isr_manager.rs,  │  │                                                                               │
+│        src/broker/grpc/transport.rs, src/broker/sbe_tcp/transport.rs        │  │                                                                               │
+│ Uses:  Cluster & Controller                                                 │  │                                                                               │
+└─────────────────────────────────────────────────────────────────────────────┘  └───────────────────────────────────────────────────────────────────────────────┘
 
 ## Feature Matrix
 
@@ -29,6 +53,7 @@ RustMQ is a Rust-based message-queue system that runs as a single binary in brok
 
 ## Cross-Cutting Concerns
 
-Topic-name validation is duplicated on both client and broker sides (`src/client/config.rs` and `src/broker/storage/traits.rs`) to prevent invalid keys early and at storage boundaries. Error-code handling is partially centralized in `kafka.proto`, but several call paths rely on hardcoded values (`6` for NOT_LEADER redirects and `27` for rebalance handling), so compatibility between enum definitions and runtime mapping must be checked when changing protocol behavior. Persistence is split by subsystem: controller metadata and peer maps persist in sled (`controller_meta`, `peers`), partition records persist in per-partition sled trees, and some important runtime states (group membership and committed offsets in current paths) remain in-memory. Observability is log-driven throughout (`log`/`env_logger`) with no built-in metrics/tracing schema, so debugging typically starts from mode startup logs, router dispatch logs, and controller/transport warning paths.
+Validation and protocol assumptions are enforced in multiple layers: client config/topic validation in `src/client/config.rs`, broker-side topic and partition checks in `src/broker/storage/traits.rs`, and RPC error mapping in `src/broker/server/core.rs` against `src/api/kafka.proto`. Persistence is mixed by subsystem: controller metadata and peer state persist through sled-backed controller state, partition records persist in per-partition sled trees, while group coordination and committed offsets are still implemented as in-memory state in the current storage/coordinator paths. Operational visibility is primarily log-driven (`log`/`env_logger`) across CLI bootstrap, router dispatch, controller tasks, and transport loops; there is no first-class metrics/tracing schema in the current code. Redirect semantics are reused across data/control paths by returning `error_code = 6` and embedding leader address hints in string fields (for example in membership responses), which callers must parse consistently.
 
 ## Notes
+
