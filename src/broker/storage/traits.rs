@@ -16,7 +16,7 @@ pub struct StoredMessage {
     pub timestamp_ms: i64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct GroupMember {
     pub member_id: String,
     pub metadata: Vec<u8>,
@@ -100,6 +100,18 @@ pub trait BrokerStorage: Send + Sync {
         member_id: &str,
     ) -> BrokerResult<()>;
     async fn leave_group(&self, group_id: &str, member_id: &str) -> BrokerResult<()>;
+
+    /// Record follower fetch progress for ISR tracking.
+    /// Default: no-op (single-node or backends without ISR state).
+    async fn record_replica_fetch(
+        &self,
+        _topic: &str,
+        _partition: i32,
+        _replica_id: u64,
+        _fetch_offset: i64,
+    ) -> BrokerResult<()> {
+        Ok(())
+    }
 
     /// Return cluster-wide metadata (broker list + current leader).
     /// Default implementation returns a single-node view using `get_coordinator_info`.
@@ -560,7 +572,48 @@ impl BrokerStorage for InMemoryStorage {
         offset: i64,
         metadata: String,
     ) -> BrokerResult<()> {
+        if offset < 0 {
+            return Err(BrokerError::Validation(format!(
+                "offset must be >= 0, got {}",
+                offset
+            )));
+        }
         let mut inner = self.inner.write().await;
+        let Some(num_partitions) = inner.topics.get(topic).copied() else {
+            return Err(BrokerError::NotFound(format!("Unknown topic: {}", topic)));
+        };
+        if partition < 0 || partition >= num_partitions {
+            return Err(BrokerError::Validation(format!(
+                "partition {} out of range for topic '{}' (num_partitions={})",
+                partition, topic, num_partitions
+            )));
+        }
+        let log_end = inner
+            .next_offsets
+            .get(&(topic.to_string(), partition))
+            .copied()
+            .unwrap_or(0);
+        if offset > log_end {
+            return Err(BrokerError::Validation(format!(
+                "offset {} is ahead of log end {} for {}-{}",
+                offset, log_end, topic, partition
+            )));
+        }
+
+        if let Some((prev_offset, _)) = inner
+            .offsets
+            .get(group)
+            .and_then(|topics| topics.get(topic))
+            .and_then(|partitions| partitions.get(&partition))
+        {
+            if offset < *prev_offset {
+                return Err(BrokerError::Validation(format!(
+                    "offset regression for ({}, {}, {}): {} -> {}",
+                    group, topic, partition, prev_offset, offset
+                )));
+            }
+        }
+
         inner
             .offsets
             .entry(group.to_string())
@@ -595,10 +648,21 @@ impl BrokerStorage for InMemoryStorage {
         &self,
         group_id: &str,
         member_id: &str,
-        _protocol_type: &str,
+        protocol_type: &str,
         protocol_metadata: &[u8],
         session_timeout_ms: i64,
     ) -> BrokerResult<(i32, String, String, Vec<GroupMember>)> {
+        if protocol_type != "consumer" {
+            return Err(BrokerError::Validation(format!(
+                "unsupported protocol_type '{}'",
+                protocol_type
+            )));
+        }
+        if protocol_metadata.is_empty() {
+            return Err(BrokerError::Validation(
+                "join_group requires non-empty protocol metadata".to_string(),
+            ));
+        }
         let topic = std::str::from_utf8(protocol_metadata)
             .unwrap_or("")
             .to_string();
@@ -684,7 +748,7 @@ impl BrokerStorage for InMemoryStorage {
     async fn sync_group(
         &self,
         group_id: &str,
-        _generation_id: i32,
+        generation_id: i32,
         member_id: &str,
     ) -> BrokerResult<Vec<u8>> {
         let inner = self.inner.read().await;
@@ -692,6 +756,12 @@ impl BrokerStorage for InMemoryStorage {
             .groups
             .get(group_id)
             .ok_or_else(|| BrokerError::NotFound("Group not found".to_string()))?;
+        if generation_id != group.generation_id {
+            return Err(BrokerError::Validation(format!(
+                "generation mismatch for group '{}': expected {}, got {}",
+                group_id, group.generation_id, generation_id
+            )));
+        }
         if group.status == GroupStatus::PreparingRebalance {
             return Err(BrokerError::RebalanceInProgress);
         }
@@ -706,7 +776,7 @@ impl BrokerStorage for InMemoryStorage {
     async fn heartbeat(
         &self,
         group_id: &str,
-        _generation_id: i32,
+        generation_id: i32,
         member_id: &str,
     ) -> BrokerResult<()> {
         let mut inner = self.inner.write().await;
@@ -714,6 +784,12 @@ impl BrokerStorage for InMemoryStorage {
             .groups
             .get_mut(group_id)
             .ok_or_else(|| BrokerError::NotFound(format!("Unknown group: {}", group_id)))?;
+        if generation_id != group.generation_id {
+            return Err(BrokerError::Validation(format!(
+                "generation mismatch for group '{}': expected {}, got {}",
+                group_id, group.generation_id, generation_id
+            )));
+        }
         let member = group
             .members
             .iter_mut()
@@ -942,5 +1018,63 @@ mod tests {
             vec![5],
             "latest offset must reflect high-watermark"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_offset_rejects_regression_and_out_of_range() {
+        let storage = InMemoryStorage::new(1, "localhost".to_string(), 50051);
+        storage.create_topic("events", 1).await.unwrap();
+        storage
+            .produce_message("events", 0, None, b"a".to_vec())
+            .await
+            .unwrap();
+        storage
+            .produce_message("events", 0, None, b"b".to_vec())
+            .await
+            .unwrap();
+
+        storage
+            .commit_offset("g1", "events", 0, 2, String::new())
+            .await
+            .unwrap();
+
+        let regressed = storage
+            .commit_offset("g1", "events", 0, 1, String::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(regressed, BrokerError::Validation(_)));
+
+        let out_of_range = storage
+            .commit_offset("g1", "events", 0, 5, String::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(out_of_range, BrokerError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn sync_group_rejects_wrong_generation() {
+        let storage = InMemoryStorage::new(1, "localhost".to_string(), 50051);
+        storage.create_topic("events", 1).await.unwrap();
+        let (generation_id, _, _, _) = storage
+            .join_group("g1", "m1", "consumer", b"events", 30_000)
+            .await
+            .unwrap();
+
+        let err = storage
+            .sync_group("g1", generation_id + 1, "m1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BrokerError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn join_group_rejects_unsupported_protocol_type() {
+        let storage = InMemoryStorage::new(1, "localhost".to_string(), 50051);
+        storage.create_topic("events", 1).await.unwrap();
+        let err = storage
+            .join_group("g1", "m1", "other", b"events", 30_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BrokerError::Validation(_)));
     }
 }

@@ -349,6 +349,7 @@ message AddNodeRequest {
 message AddNodeResponse {
   int32 error_code = 1;
   string error_message = 2;
+  string leader_addr = 3;
 }
 
 message RemoveNodeRequest {
@@ -358,6 +359,7 @@ message RemoveNodeRequest {
 message RemoveNodeResponse {
   int32 error_code = 1;
   string error_message = 2;
+  string leader_addr = 3;
 }
 
 // ==================== ERROR CODES ====================

@@ -52,7 +52,7 @@ impl ConnectionManager {
             let tcp_addr = {
                 let peers = self.peers.read().unwrap();
                 match peers.get(&msg.to) {
-                    Some(p) => Self::bare_addr(&p.rpc_addr),
+                    Some(p) => Self::resolve_peer_addr(p),
                     None => {
                         log::warn!("[sbe-tcp] no address for peer {}", msg.to);
                         continue;
@@ -90,6 +90,16 @@ impl ConnectionManager {
     /// Strip "http://" prefix from rpc_addr (gRPC scheme not needed for raw TCP).
     fn bare_addr(addr: &str) -> String {
         addr.trim_start_matches("http://").to_owned()
+    }
+
+    fn resolve_peer_addr(peer: &PeerInfo) -> String {
+        if let Some(sbe_addr) = peer.sbe_tcp_addr.as_deref() {
+            let trimmed = sbe_addr.trim();
+            if !trimmed.is_empty() {
+                return Self::bare_addr(trimmed);
+            }
+        }
+        Self::bare_addr(&peer.rpc_addr)
     }
 
     async fn get_or_spawn(&self, peer_id: u64, addr: String) -> mpsc::Sender<Frame> {
@@ -143,5 +153,31 @@ async fn writer_task(peer_id: u64, addr: String, mut rx: mpsc::Receiver<Frame>) 
         }
         // Otherwise the write failed — reconnect
         log::info!("[sbe-tcp] reconnecting to peer {}", peer_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionManager;
+    use crate::broker::PeerInfo;
+
+    #[test]
+    fn resolve_peer_addr_prefers_sbe_tcp_addr() {
+        let peer = PeerInfo {
+            rpc_addr: "http://127.0.0.1:9300".to_string(),
+            api_addr: "127.0.0.1:9092".to_string(),
+            sbe_tcp_addr: Some("127.0.0.1:9400".to_string()),
+        };
+        assert_eq!(ConnectionManager::resolve_peer_addr(&peer), "127.0.0.1:9400");
+    }
+
+    #[test]
+    fn resolve_peer_addr_falls_back_to_rpc_addr() {
+        let peer = PeerInfo {
+            rpc_addr: "http://127.0.0.1:9300".to_string(),
+            api_addr: "127.0.0.1:9092".to_string(),
+            sbe_tcp_addr: None,
+        };
+        assert_eq!(ConnectionManager::resolve_peer_addr(&peer), "127.0.0.1:9300");
     }
 }

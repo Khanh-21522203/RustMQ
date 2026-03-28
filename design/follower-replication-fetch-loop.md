@@ -77,5 +77,8 @@ Persistence behavior:
 Changes:
 
 - Implement a production `ReplicaFetcher` and hook task start/stop to assignment and leadership transitions.
+  > Blocked: `ReplicationManager` in [`src/broker/kraft/replication_manager.rs`](../src/broker/kraft/replication_manager.rs) remains trait-driven test scaffolding, and runtime code in [`src/broker/kraft/broker.rs`](../src/broker/kraft/broker.rs) / [`src/main.rs`](../src/main.rs) still lacks a metadata-driven reconciliation loop that starts/stops follower tasks on partition assignment changes. Implementing this requires choosing where assignment watches live (broker loop vs controller callback) and wiring a production fetch RPC client.
 - Add per-task health metrics (`last_success_ms`, lag, retry count) and alertable logs.
+  > Blocked: there is no per-task metrics state or exporter surface in [`src/broker/kraft/replication_manager.rs`](../src/broker/kraft/replication_manager.rs). Options to decide: (1) in-process gauges/log snapshots only; or (2) structured metrics sink (Prometheus/OpenTelemetry). The required observability interface is not yet present in this repo.
 - Add configurable backoff tuning for fetch-loop retries.
+  > Blocked: retry backoff constants are currently hardcoded in [`src/broker/kraft/replication_manager.rs`](../src/broker/kraft/replication_manager.rs), and there is no replication subsection in [`src/broker/config.rs`](../src/broker/config.rs) for fetch-loop tuning. This needs a config-contract decision (global vs per-partition tuning and default safety bounds) before implementation.

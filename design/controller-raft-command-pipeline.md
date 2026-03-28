@@ -91,6 +91,9 @@ Persistence behavior:
 ### Observability and Debugging
 
 - Logs include restored peers/metadata, conf change add/remove events, and apply failures.
+- Proposal queue/apply latency is logged in `ControllerRaftNode`:
+- warn-level when queue or apply latency exceeds thresholds,
+- debug-level latency traces otherwise.
 - Debug proposal stalls by checking `pending_replies` clearing on leadership transitions.
 - Debug metadata drift by inspecting `controller_meta` serialization/load paths.
 
@@ -102,5 +105,6 @@ Persistence behavior:
 Changes:
 
 - Replace `MemStorage` with durable Raft log/hardstate storage.
+  > Blocked: controller consensus still uses `RawNode<MemStorage>` in [`src/broker/controller/raft_node.rs`](../src/broker/controller/raft_node.rs). Replacing this requires selecting and integrating a disk-backed `raft::Storage` implementation (for example a custom sled-backed log/hardstate store) and migrating recovery paths in `handle_ready`. Current code only persists metadata snapshots/peers, not consensus log/hardstate.
 - Define snapshot/compaction policy and startup recovery guarantees.
-- Add proposal queue/apply latency instrumentation to improve operational debugging.
+  > Blocked: snapshot/compaction policy cannot be finalized while Raft still runs on `MemStorage`; once durable Raft storage is introduced, policy choices must define thresholds, snapshot trigger points, retained log window, and restore guarantees across restarts in [`src/broker/controller/raft_node.rs`](../src/broker/controller/raft_node.rs).

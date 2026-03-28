@@ -48,7 +48,7 @@ async fn start_broker(addr: &str) -> Result<()> {
         broker_core.run().await;
     });
 
-    let grpc_server = KafkaBrokerServer::new(rpc_tx);
+    let grpc_server = KafkaBrokerServer::new(rpc_tx, None);
     let addr_owned = addr.to_string();
 
     tokio::spawn(async move {
@@ -118,6 +118,7 @@ async fn benchmark_e2e_latency(message_count: usize) -> Result<(Duration, Vec<Du
         auto_commit: true,
         auto_commit_interval_ms: 5000,
         poll_interval_ms: 10,
+        max_messages_per_poll: 1000,
     };
 
     let producer = Producer::new(broker_addr().as_str(), producer_config).await?;
@@ -191,6 +192,7 @@ async fn benchmark_consumer_throughput(message_count: usize) -> Result<(Duration
         auto_commit: true,
         auto_commit_interval_ms: 5000,
         poll_interval_ms: 10,
+        max_messages_per_poll: 1000,
     };
 
     let counter = Arc::new(AtomicUsize::new(0));

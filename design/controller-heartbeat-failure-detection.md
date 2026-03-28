@@ -24,13 +24,15 @@ Track broker liveness through periodic heartbeat proposals and trigger partition
 
 ### System Flow
 
-1. Heartbeat loop (every 3s):
+1. Heartbeat loop (interval configured by `RaftConfig.broker_heartbeat_propose_interval_ms`):
 - Capture wall-clock ms.
 - Call `propose_broker_heartbeat(node_id, timestamp_ms)`.
 - Ignore/warn on non-`NOT_LEADER` errors.
-2. Failure detector loop (every 5s, controller-only):
+2. Failure detector loop (interval configured by `RaftConfig.failure_detector_interval_ms`, controller-only):
 - Load metadata snapshot.
-- For each broker with `last_seen_ms > 0`, check `now - last_seen_ms > 15000`.
+- For each broker with `last_seen_ms > 0`, check `now - last_seen_ms > dead_broker_threshold_ms`.
+- Track consecutive missed windows per broker and require `dead_broker_consecutive_misses` before proposing dead.
+- Enforce per-broker cooldown (`dead_broker_proposal_cooldown_ms`) between repeated dead proposals.
 - Compute failover using `compute_failover_assignments(meta, dead_broker_id)`.
 - Propose `MarkBrokerDead` with computed assignments.
 3. State machine apply:
@@ -67,21 +69,18 @@ Persistence behavior:
 
 - Heartbeats proposed on follower nodes return `NOT_LEADER` by design.
 - Brokers that never heartbeat (`last_seen_ms == 0`) are skipped by dead check grace rule.
-- Repeated detector runs may reattempt dead proposals if metadata transitions lag.
+- Repeated detector runs are rate-limited by dead-proposal cooldown guardrails.
 
 ### Observability and Debugging
 
 - Warn logs: suspected dead broker and elapsed ms.
 - Error logs: `propose_mark_broker_dead` failures.
-- Debug heartbeat by tracing 3s proposals and metadata `last_seen_ms` updates.
+- Debug heartbeat by tracing configured proposal interval and metadata `last_seen_ms` updates.
 
 ### Risks and Notes
 
-- Fixed dead threshold (15s) is hardcoded in `main.rs` task.
+- Detector intervals/thresholds are configurable via `RaftConfig`.
 - Liveness detection is clock-based and local; no quorum-based health check in this layer.
 
 Changes:
 
-- Move heartbeat/dead-broker thresholds and detector intervals into broker config.
-- Require consecutive missed-heartbeat windows before `MarkBrokerDead`.
-- Add guardrails to prevent repeated dead-node proposals for the same broker within short windows.

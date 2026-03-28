@@ -466,6 +466,8 @@ pub struct AddNodeResponse {
     pub error_code: i32,
     #[prost(string, tag = "2")]
     pub error_message: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub leader_addr: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct RemoveNodeRequest {
@@ -478,6 +480,8 @@ pub struct RemoveNodeResponse {
     pub error_code: i32,
     #[prost(string, tag = "2")]
     pub error_message: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub leader_addr: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

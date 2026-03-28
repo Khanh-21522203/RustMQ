@@ -29,11 +29,11 @@ Run consumer-side polling loops with optional group membership, partition assign
 - Join/sync group (`join_and_sync`) if `group_id` exists.
 - Resolve initial offsets per active partition (`resolve_starting_offsets`).
 - Spawn heartbeat task and poll/commit loop task.
-2. Heartbeat task every 10s sends `HeartbeatRequest`.
+2. Heartbeat task every 10s sends `HeartbeatRequest` with current `(member_id, generation_id)` from shared group session state.
 3. Poll loop:
 - If rebalance flag set, rejoin and refresh active partitions.
-- Else fetch all active partitions (`fetch_all_partitions`) and call handler for each message.
-- Update in-memory next offsets (`offset + 1`).
+- Else fetch all active partitions (`fetch_all_partitions`) capped by `max_messages_per_poll`.
+- Call handler for each message and advance in-memory next offsets (`offset + 1`) only after successful handler completion.
 4. Auto-commit loop commits all current offsets when enabled.
 5. `shutdown` signals tasks, optionally commits, and sends `LeaveGroup`.
 
@@ -59,7 +59,9 @@ Persistence behavior:
 - Offset sentinel contract:
 - `offset = -2` -> earliest, `-1` -> latest, `>= 0` -> explicit start offset.
 - Group retry contract:
-- `error_code = 27` treated as rebalance and retried in `join_and_sync`.
+- `error_code = 14` (`REBALANCE_IN_PROGRESS`) treated as rebalance and retried in `join_and_sync`.
+- Backpressure contract:
+- `max_messages_per_poll` bounds records fetched/handled per poll cycle.
 
 ### Dependencies
 
@@ -76,7 +78,7 @@ Persistence behavior:
 - Rejoin may fail transiently and is retried by loop.
 - Mutex poison errors are converted to `anyhow` failures.
 - Commit is skipped when no `group_id`.
-- Heartbeat sends `generation_id = 0` (broker ignores currently), which may break if broker semantics tighten.
+- Manual `poll()` mode still advances offsets on returned messages because handler success is managed by caller code.
 
 ### Observability and Debugging
 
@@ -85,11 +87,8 @@ Persistence behavior:
 
 ### Risks and Notes
 
-- Offsets are advanced in memory before handler success is guaranteed for all downstream side effects.
+- Background handler mode is now at-least-once friendly within process lifetime by advancing offsets only on handler success.
 - Manual and background modes share core helpers but have distinct timing behavior, so bugs can appear in one mode only.
 
 Changes:
 
-- Track and send real `generation_id` in heartbeat and sync requests.
-- Advance in-memory and committed offsets after successful handler completion (or document explicit at-most-once mode).
-- Add backpressure controls for handler throughput and fetch rate.

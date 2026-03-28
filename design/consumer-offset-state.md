@@ -25,8 +25,13 @@ Store and retrieve committed consumer offsets per `(group, topic, partition)`.
 
 1. `handle_commit_offset` iterates topic/partition entries and calls `storage.commit_offset`.
 2. `handle_fetch_offset` iterates requested partitions and calls `storage.fetch_offset`.
-3. In-memory backend writes nested map entries.
-4. KRaft backend writes to local `committed_offsets` map in `KRaftBroker`.
+3. Both in-memory and KRaft backends validate commits before storing:
+- offset must be non-negative,
+- `(topic, partition)` must exist,
+- offset must be monotonic per `(group, topic, partition)`,
+- offset cannot exceed local log end when available.
+4. In-memory backend writes validated entries to nested map.
+5. KRaft backend writes validated entries to local `committed_offsets` map in `KRaftBroker`.
 
 ### Data Model
 
@@ -60,7 +65,7 @@ Persistence behavior:
 ### Failure Modes and Edge Cases
 
 - Storage write/read errors map to `error_code = 1`.
-- No bounds validation: committed offsets may be ahead/behind actual log range.
+- Invalid commits (negative, partition out of range, monotonic regression, local out-of-range) return validation errors.
 - No replication guarantees in current offset store implementations.
 
 ### Observability and Debugging
@@ -77,4 +82,4 @@ Persistence behavior:
 Changes:
 
 - Persist committed offsets durably (not process-local maps) and document failover semantics.
-- Add offset commit validation (range and monotonic checks per `(group, topic, partition)`).
+  > Blocked: offsets are still maintained in process-local structures in [`src/broker/storage/traits.rs`](../src/broker/storage/traits.rs) and [`src/broker/kraft/broker.rs`](../src/broker/kraft/broker.rs). A durable implementation needs a chosen authority and migration path: (1) controller-Raft-backed offset commands for replicated failover semantics; or (2) local sled offset trees per broker with explicit non-replicated failover behavior. This cycle added strict commit validation but did not introduce a durable replicated offset store.

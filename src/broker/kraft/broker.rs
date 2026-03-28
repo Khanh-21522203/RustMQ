@@ -185,7 +185,7 @@ impl KRaftBroker {
 
     /// Record that follower `replica_id` has fetched up to `fetch_offset`.
     /// Called by the Fetch RPC handler when `replica_id > 0`.
-    pub async fn record_replica_fetch(
+    pub async fn record_replica_fetch_progress(
         &self,
         topic: &str,
         partition: i32,
@@ -424,10 +424,51 @@ impl BrokerStorage for KRaftBroker {
         offset: i64,
         metadata: String,
     ) -> BrokerResult<()> {
-        self.committed_offsets
-            .write()
+        if offset < 0 {
+            return Err(BrokerError::Validation(format!(
+                "offset must be >= 0, got {}",
+                offset
+            )));
+        }
+
+        let meta = self.controller.metadata().await;
+        let Some(topic_record) = meta.topics.get(topic) else {
+            return Err(BrokerError::NotFound(format!("Unknown topic: {}", topic)));
+        };
+        if partition < 0 || partition >= topic_record.num_partitions {
+            return Err(BrokerError::Validation(format!(
+                "partition {} out of range for topic '{}' (num_partitions={})",
+                partition, topic, topic_record.num_partitions
+            )));
+        }
+
+        if let Some(log) = self
+            .partition_store
+            .read()
             .await
-            .insert((group.to_string(), topic.to_string(), partition), (offset, metadata));
+            .get(&(topic.to_string(), partition))
+            .cloned()
+        {
+            let log_end = log.log_end_offset();
+            if offset > log_end {
+                return Err(BrokerError::Validation(format!(
+                    "offset {} is ahead of log end {} for {}-{}",
+                    offset, log_end, topic, partition
+                )));
+            }
+        }
+
+        let mut committed = self.committed_offsets.write().await;
+        let key = (group.to_string(), topic.to_string(), partition);
+        if let Some((prev_offset, _)) = committed.get(&key) {
+            if offset < *prev_offset {
+                return Err(BrokerError::Validation(format!(
+                    "offset regression for ({}, {}, {}): {} -> {}",
+                    group, topic, partition, prev_offset, offset
+                )));
+            }
+        }
+        committed.insert(key, (offset, metadata));
         Ok(())
     }
 
@@ -455,10 +496,16 @@ impl BrokerStorage for KRaftBroker {
         &self,
         group_id: &str,
         member_id: &str,
-        _protocol_type: &str,
+        protocol_type: &str,
         protocol_metadata: &[u8],
         session_timeout_ms: i64,
     ) -> BrokerResult<(i32, String, String, Vec<GroupMember>)> {
+        if protocol_type != "consumer" {
+            return Err(BrokerError::Validation(format!(
+                "unsupported protocol_type '{}'",
+                protocol_type
+            )));
+        }
         self.group_coordinator
             .join_group(group_id, member_id, protocol_metadata, session_timeout_ms)
             .await
@@ -467,19 +514,23 @@ impl BrokerStorage for KRaftBroker {
     async fn sync_group(
         &self,
         group_id: &str,
-        _generation_id: i32,
+        generation_id: i32,
         member_id: &str,
     ) -> BrokerResult<Vec<u8>> {
-        self.group_coordinator.sync_group(group_id, member_id).await
+        self.group_coordinator
+            .sync_group(group_id, generation_id, member_id)
+            .await
     }
 
     async fn heartbeat(
         &self,
         group_id: &str,
-        _generation_id: i32,
+        generation_id: i32,
         member_id: &str,
     ) -> BrokerResult<()> {
-        self.group_coordinator.heartbeat(group_id, member_id).await
+        self.group_coordinator
+            .heartbeat(group_id, generation_id, member_id)
+            .await
     }
 
     async fn leave_group(&self, group_id: &str, member_id: &str) -> BrokerResult<()> {
@@ -520,6 +571,18 @@ impl BrokerStorage for KRaftBroker {
             .propose_remove_node(node_id)
             .await
             .map_err(BrokerError::from)
+    }
+
+    async fn record_replica_fetch(
+        &self,
+        topic: &str,
+        partition: i32,
+        replica_id: u64,
+        fetch_offset: i64,
+    ) -> BrokerResult<()> {
+        self.record_replica_fetch_progress(topic, partition, replica_id, fetch_offset)
+            .await;
+        Ok(())
     }
 }
 
@@ -980,14 +1043,45 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_and_fetch_offset() {
-        let (broker, _) = make_broker(1).await;
+        let (broker, _) = make_broker_with_topic(1, "t", 1).await;
         broker
-            .commit_offset("grp", "t", 0, 42, "meta".to_string())
+            .commit_offset("grp", "t", 0, 0, "meta".to_string())
             .await
             .unwrap();
         let (off, meta) = broker.fetch_offset("grp", "t", 0).await.unwrap();
-        assert_eq!(off, 42);
+        assert_eq!(off, 0);
         assert_eq!(meta, "meta");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_offset_rejects_regression_and_out_of_range() {
+        let (broker, _) = make_broker_with_topic(1, "t", 1).await;
+        broker.on_became_leader("t", 0, vec![1]).await;
+        broker
+            .produce_message("t", 0, None, b"a".to_vec())
+            .await
+            .unwrap();
+        broker
+            .produce_message("t", 0, None, b"b".to_vec())
+            .await
+            .unwrap();
+
+        broker
+            .commit_offset("grp", "t", 0, 2, "meta".to_string())
+            .await
+            .unwrap();
+
+        let regressed = broker
+            .commit_offset("grp", "t", 0, 1, "meta".to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(regressed, BrokerError::Validation(_)));
+
+        let out_of_range = broker
+            .commit_offset("grp", "t", 0, 10, "meta".to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(out_of_range, BrokerError::Validation(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

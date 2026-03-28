@@ -25,15 +25,15 @@ Track replica fetch progress for leader-owned partitions, recompute ISR membersh
 ### System Flow
 
 1. `on_became_leader(topic, partition, isr)` opens partition log and calls `isr_mgr.add_partition(...)`.
-2. Optional progress updates are fed via `record_replica_fetch(topic, partition, replica_id, fetch_offset)`.
-3. Tick task (500ms) in `main.rs` calls `isr_mgr.tick()`.
+2. `FetchRequest.replica_id > 0` updates are fed from broker fetch handler into `record_replica_fetch(topic, partition, replica_id, fetch_offset)`.
+3. Tick task (configured by `RaftConfig.isr_tick_interval_ms`) in `main.rs` calls `isr_mgr.tick()`.
 4. `tick()`:
 - Refresh leader progress from local LEO.
 - Build new ISR using lag (`lag_max`) and staleness (`stale_ms`) filters.
 - Compute new HW = min(fetch_offset across ISR members).
 - Advance log HW if larger.
 - Emit `IsrChange` when ISR or HW changes.
-5. Runtime proposes `PartitionChange` commands to controller using emitted `IsrChange`.
+5. Runtime proposes `PartitionChange` commands to controller using emitted `IsrChange`, with per-partition debounce window (`RaftConfig.isr_proposal_min_interval_ms`) to reduce churn on frequent HW-only deltas.
 
 ### Data Model
 
@@ -78,11 +78,10 @@ Persistence behavior:
 
 ### Risks and Notes
 
-- Current fetch handler path does not consume `FetchRequest.replica_id` to feed `record_replica_fetch`, so ISR accuracy depends on other wiring.
+- Fetch handler now wires follower `replica_id` progress into ISR tracking.
 - ISR changes are eventually consistent with controller metadata based on proposal success.
 
 Changes:
 
-- Wire `FetchRequest.replica_id` progress updates into `IsrManager::record_fetch_progress`.
-- Add debounce/rate-limits for ISR change proposals to reduce control-plane churn.
 - Persist/restore ISR tracking inputs where needed to reduce restart-time ISR oscillation.
+  > Blocked: ISR tracking state (`progress`, `current_isr`) is in-memory-only inside [`src/broker/kraft/isr_manager.rs`](../src/broker/kraft/isr_manager.rs) and is rebuilt from live traffic after restart. Persisting/restoring this requires deciding storage location and replay rules (for example storing replica progress snapshots per partition in local sled vs deriving exclusively from controller metadata + fresh follower fetches). Current runtime does not have that persistence contract.

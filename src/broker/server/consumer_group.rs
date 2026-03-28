@@ -96,6 +96,11 @@ impl ConsumerGroupCoordinator {
         protocol_metadata: &[u8],
         session_timeout_ms: i64,
     ) -> BrokerResult<(i32, String, String, Vec<GroupMember>)> {
+        if protocol_metadata.is_empty() {
+            return Err(BrokerError::Validation(
+                "join_group requires non-empty protocol metadata".to_string(),
+            ));
+        }
         let topic = std::str::from_utf8(protocol_metadata)
             .unwrap_or("")
             .to_string();
@@ -176,6 +181,7 @@ impl ConsumerGroupCoordinator {
     pub async fn sync_group(
         &self,
         group_id: &str,
+        generation_id: i32,
         member_id: &str,
     ) -> BrokerResult<Vec<u8>> {
         let inner = self.inner.read().await;
@@ -183,6 +189,12 @@ impl ConsumerGroupCoordinator {
             .groups
             .get(group_id)
             .ok_or_else(|| BrokerError::NotFound("Group not found".to_string()))?;
+        if generation_id != group.generation_id {
+            return Err(BrokerError::Validation(format!(
+                "generation mismatch for group '{}': expected {}, got {}",
+                group_id, group.generation_id, generation_id
+            )));
+        }
         if group.status == GroupStatus::PreparingRebalance {
             return Err(BrokerError::RebalanceInProgress);
         }
@@ -197,6 +209,7 @@ impl ConsumerGroupCoordinator {
     pub async fn heartbeat(
         &self,
         group_id: &str,
+        generation_id: i32,
         member_id: &str,
     ) -> BrokerResult<()> {
         let mut inner = self.inner.write().await;
@@ -204,6 +217,12 @@ impl ConsumerGroupCoordinator {
             .groups
             .get_mut(group_id)
             .ok_or_else(|| BrokerError::NotFound(format!("Unknown group: {}", group_id)))?;
+        if generation_id != group.generation_id {
+            return Err(BrokerError::Validation(format!(
+                "generation mismatch for group '{}': expected {}, got {}",
+                group_id, group.generation_id, generation_id
+            )));
+        }
         let member = group
             .members
             .iter_mut()
@@ -391,7 +410,7 @@ mod tests {
         assert_eq!(members.len(), 1);
 
         let assignment: Vec<i32> =
-            bincode::deserialize(&coord.sync_group("g1", "m1").await.unwrap()).unwrap();
+            bincode::deserialize(&coord.sync_group("g1", gen, "m1").await.unwrap()).unwrap();
         assert_eq!(assignment, vec![0, 1, 2]);
     }
 
@@ -406,16 +425,19 @@ mod tests {
             .unwrap();
         assert_eq!(gen, 1);
 
-        let err = coord.sync_group("g1", "m1").await.unwrap_err();
+        let err = coord.sync_group("g1", gen, "m1").await.unwrap_err();
         assert!(matches!(err, BrokerError::RebalanceInProgress));
 
-        coord.join_group("g1", "m1", b"events", 30_000).await.unwrap();
+        let (gen_after, _, _, _) = coord
+            .join_group("g1", "m1", b"events", 30_000)
+            .await
+            .unwrap();
         coord.join_group("g1", "m2", b"events", 30_000).await.unwrap();
 
         let a1: Vec<i32> =
-            bincode::deserialize(&coord.sync_group("g1", "m1").await.unwrap()).unwrap();
+            bincode::deserialize(&coord.sync_group("g1", gen_after, "m1").await.unwrap()).unwrap();
         let a2: Vec<i32> =
-            bincode::deserialize(&coord.sync_group("g1", "m2").await.unwrap()).unwrap();
+            bincode::deserialize(&coord.sync_group("g1", gen_after, "m2").await.unwrap()).unwrap();
         let mut combined = [a1, a2].concat();
         combined.sort();
         assert_eq!(combined, vec![0, 1]);
@@ -424,16 +446,27 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_unknown_member_returns_error() {
         let coord = ConsumerGroupCoordinator::new();
-        coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
-        let err = coord.heartbeat("g1", "nobody").await.unwrap_err();
+        let (gen, _, _, _) = coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
+        let err = coord.heartbeat("g1", gen, "nobody").await.unwrap_err();
         assert!(matches!(err, BrokerError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn heartbeat_unknown_group_returns_error() {
         let coord = ConsumerGroupCoordinator::new();
-        let err = coord.heartbeat("no-group", "m1").await.unwrap_err();
+        let err = coord.heartbeat("no-group", 0, "m1").await.unwrap_err();
         assert!(matches!(err, BrokerError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_generation_mismatch_returns_validation_error() {
+        let coord = coord_with_topic("events", 1).await;
+        let (gen, _, _, _) = coord
+            .join_group("g1", "m1", b"events", 30_000)
+            .await
+            .unwrap();
+        let err = coord.heartbeat("g1", gen + 1, "m1").await.unwrap_err();
+        assert!(matches!(err, BrokerError::Validation(_)));
     }
 
     #[tokio::test]
@@ -446,9 +479,9 @@ mod tests {
 
         coord.leave_group("g1", "m2").await.unwrap();
 
-        coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
+        let (gen, _, _, _) = coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
         let assignment: Vec<i32> =
-            bincode::deserialize(&coord.sync_group("g1", "m1").await.unwrap()).unwrap();
+            bincode::deserialize(&coord.sync_group("g1", gen, "m1").await.unwrap()).unwrap();
         assert_eq!(assignment, vec![0, 1]);
     }
 
@@ -456,16 +489,16 @@ mod tests {
     async fn update_topic_affects_future_assignments() {
         let coord = ConsumerGroupCoordinator::new();
         coord.update_topic("t".to_string(), 1).await;
-        coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
+        let (gen1, _, _, _) = coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
         let a: Vec<i32> =
-            bincode::deserialize(&coord.sync_group("g1", "m1").await.unwrap()).unwrap();
+            bincode::deserialize(&coord.sync_group("g1", gen1, "m1").await.unwrap()).unwrap();
         assert_eq!(a, vec![0]);
 
         coord.update_topic("t".to_string(), 3).await;
         coord.leave_group("g1", "m1").await.unwrap();
-        coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
+        let (gen2, _, _, _) = coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
         let a: Vec<i32> =
-            bincode::deserialize(&coord.sync_group("g1", "m1").await.unwrap()).unwrap();
+            bincode::deserialize(&coord.sync_group("g1", gen2, "m1").await.unwrap()).unwrap();
         assert_eq!(a, vec![0, 1, 2]);
     }
 
@@ -473,14 +506,14 @@ mod tests {
     async fn round_robin_assignment_is_balanced() {
         let coord = coord_with_topic("t", 4).await;
         coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
-        coord.join_group("g1", "m2", b"t", 30_000).await.unwrap();
+        let (gen, _, _, _) = coord.join_group("g1", "m2", b"t", 30_000).await.unwrap();
         coord.join_group("g1", "m1", b"t", 30_000).await.unwrap();
         coord.join_group("g1", "m2", b"t", 30_000).await.unwrap();
 
         let a1: Vec<i32> =
-            bincode::deserialize(&coord.sync_group("g1", "m1").await.unwrap()).unwrap();
+            bincode::deserialize(&coord.sync_group("g1", gen, "m1").await.unwrap()).unwrap();
         let a2: Vec<i32> =
-            bincode::deserialize(&coord.sync_group("g1", "m2").await.unwrap()).unwrap();
+            bincode::deserialize(&coord.sync_group("g1", gen, "m2").await.unwrap()).unwrap();
         assert_eq!(a1.len(), 2);
         assert_eq!(a2.len(), 2);
         let mut all = [a1, a2].concat();

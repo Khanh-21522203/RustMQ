@@ -61,6 +61,39 @@ fn parse_host_port(addr: &str) -> (String, i32) {
     ("localhost".to_string(), 50051)
 }
 
+fn now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn jittered_backoff(attempt: u32, base_ms: u64, max_jitter_ms: u64) -> std::time::Duration {
+    let exp = 2u64.saturating_pow((attempt.saturating_sub(1)).min(5));
+    let backoff = base_ms.saturating_mul(exp);
+    let jitter = if max_jitter_ms == 0 {
+        0
+    } else {
+        now_ms_u64() % (max_jitter_ms + 1)
+    };
+    std::time::Duration::from_millis(backoff.saturating_add(jitter))
+}
+
+async fn wait_for_local_listener(addr: &str, max_wait_ms: u64) -> bool {
+    use tokio::net::TcpStream;
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(max_wait_ms.max(1));
+    loop {
+        if TcpStream::connect(addr).await.is_ok() {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Simple message handler that prints messages
 struct PrintHandler;
 
@@ -130,7 +163,7 @@ async fn run_broker(args: Args) -> Result<()> {
         broker_core.run().await;
     });
 
-    let grpc_server = KafkaBrokerServer::new(rpc_tx);
+    let grpc_server = KafkaBrokerServer::new(rpc_tx, config.membership_api_token.clone());
     let api_addr = config.api_addr.clone();
     tokio::spawn(async move {
         if let Err(e) = grpc_server.run(&api_addr).await {
@@ -178,11 +211,8 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
                 .collect()
         };
 
-    let rebalance_timeout_ms = config
-        .raft
-        .as_ref()
-        .map(|r| r.rebalance_timeout_ms)
-        .unwrap_or(broker::config::RaftConfig::default().rebalance_timeout_ms);
+    let raft_cfg = config.raft.clone().unwrap_or_default();
+    let rebalance_timeout_ms = raft_cfg.rebalance_timeout_ms;
 
     // Build ControllerRaftNode with the configured transport.
     let controller_storage = if config.transport == "sbe_tcp" {
@@ -200,7 +230,7 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
             Box::new(transport),
             step_tx,
             step_rx,
-            config.raft.clone(),
+            Some(raft_cfg.clone()),
             config.api_addr.clone(),
         )
         .map_err(|e| anyhow::anyhow!("Failed to create KRaft controller: {:?}", e))?;
@@ -227,7 +257,7 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
             Box::new(transport),
             step_tx,
             step_rx,
-            config.raft.clone(),
+            Some(raft_cfg.clone()),
             config.api_addr.clone(),
         )
         .map_err(|e| anyhow::anyhow!("Failed to create KRaft controller: {:?}", e))?;
@@ -261,11 +291,16 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
     )
     .await;
 
-    // ISR tick loop: every 500 ms recompute ISR and propose any changes.
+    // ISR tick loop: recompute ISR and propose changes on configured cadence.
     let isr_mgr = broker.isr_mgr.clone();
     let ctrl_isr = controller.clone();
+    let isr_tick_interval_ms = raft_cfg.isr_tick_interval_ms.max(1);
+    let isr_proposal_min_interval_ms = raft_cfg.isr_proposal_min_interval_ms;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        use std::collections::HashMap;
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(isr_tick_interval_ms));
+        let mut last_proposed: HashMap<(String, i32), (Vec<u64>, u64)> = HashMap::new();
         loop {
             interval.tick().await;
             let changes = isr_mgr.tick().await;
@@ -273,40 +308,57 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
                 continue;
             }
             let meta = ctrl_isr.metadata().await;
+            let now_ms = now_ms_u64();
             for change in changes {
+                let key = (change.topic.clone(), change.partition);
+                if let Some((prev_isr, proposed_at_ms)) = last_proposed.get(&key) {
+                    if *prev_isr == change.new_isr
+                        && now_ms.saturating_sub(*proposed_at_ms) < isr_proposal_min_interval_ms
+                    {
+                        log::debug!(
+                            "Debouncing ISR proposal for {}-{} within {}ms window",
+                            key.0,
+                            key.1,
+                            isr_proposal_min_interval_ms
+                        );
+                        continue;
+                    }
+                }
                 let replicas = meta
                     .partitions
                     .get(&(change.topic.clone(), change.partition))
                     .map(|p| p.replicas.clone())
                     .unwrap_or_default();
+                let new_isr = change.new_isr.clone();
                 if let Err(e) = ctrl_isr
                     .propose_partition_change(
                         change.topic,
                         change.partition,
                         node_id,
-                        change.new_isr,
+                        new_isr.clone(),
                         replicas,
                     )
                     .await
                 {
                     log::warn!("ISR change propose failed: {}", e);
+                } else {
+                    last_proposed.insert(key, (new_isr, now_ms));
                 }
             }
         }
     });
 
-    // Heartbeat task: propose a timestamp every 3 s so the controller knows
+    // Heartbeat task: propose timestamps on configured cadence so the controller knows
     // this broker is alive.  NOT_LEADER is normal on non-leader nodes.
     {
         let ctrl_hb = controller.clone();
+        let heartbeat_interval_ms = raft_cfg.broker_heartbeat_propose_interval_ms.max(1);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(heartbeat_interval_ms));
             loop {
                 interval.tick().await;
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let ts = now_ms_u64();
                 if let Err(e) = ctrl_hb.propose_broker_heartbeat(node_id, ts).await {
                     // NOT_LEADER is expected on follower nodes; only warn on other errors.
                     if !e.to_string().contains("NOT_LEADER") {
@@ -320,40 +372,80 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
     }
 
     // Failure detector task: runs only on the active controller (leader).
-    // Every 5 s scan brokers; declare dead if last_seen_ms > 0 and gap > 15 s.
+    // Scan cadence and dead thresholds are configured via RaftConfig.
     {
         use broker::controller::state_machine::compute_failover_assignments;
         let ctrl_fd = controller.clone();
+        let detector_interval_ms = raft_cfg.failure_detector_interval_ms.max(1);
+        let dead_threshold_ms = raft_cfg.dead_broker_threshold_ms;
+        let consecutive_misses = raft_cfg.dead_broker_consecutive_misses.max(1);
+        let dead_proposal_cooldown_ms = raft_cfg.dead_broker_proposal_cooldown_ms;
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            use std::collections::HashMap;
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(detector_interval_ms));
+            let mut missed_windows: HashMap<u64, u32> = HashMap::new();
+            let mut last_dead_proposal_ms: HashMap<u64, u64> = HashMap::new();
             loop {
                 interval.tick().await;
                 if !ctrl_fd.is_controller() {
                     continue;
                 }
                 let meta = ctrl_fd.metadata().await;
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let now_ms = now_ms_u64();
+                missed_windows.retain(|broker_id, _| meta.brokers.contains_key(broker_id));
+                last_dead_proposal_ms.retain(|broker_id, _| meta.brokers.contains_key(broker_id));
                 for (broker_id, reg) in &meta.brokers {
                     // Grace period: skip brokers that have never sent a heartbeat.
                     if reg.last_seen_ms == 0 {
+                        missed_windows.remove(broker_id);
                         continue;
                     }
-                    if now_ms.saturating_sub(reg.last_seen_ms) > 15_000 {
-                        log::warn!(
-                            "Broker {} appears dead (last_seen {}ms ago); electing new leaders",
+                    let elapsed = now_ms.saturating_sub(reg.last_seen_ms);
+                    if elapsed <= dead_threshold_ms {
+                        missed_windows.remove(broker_id);
+                        continue;
+                    }
+
+                    let missed = missed_windows.entry(*broker_id).or_insert(0);
+                    *missed = missed.saturating_add(1);
+
+                    if *missed < consecutive_misses {
+                        log::debug!(
+                            "Broker {} missed heartbeat window {}/{} (elapsed={}ms)",
                             broker_id,
-                            now_ms - reg.last_seen_ms
+                            *missed,
+                            consecutive_misses,
+                            elapsed
                         );
-                        let assignments = compute_failover_assignments(&meta, *broker_id);
-                        if let Err(e) = ctrl_fd
-                            .propose_mark_broker_dead(*broker_id, assignments)
-                            .await
-                        {
-                            log::error!("propose_mark_broker_dead failed: {}", e);
+                        continue;
+                    }
+
+                    if let Some(last_ms) = last_dead_proposal_ms.get(broker_id) {
+                        if now_ms.saturating_sub(*last_ms) < dead_proposal_cooldown_ms {
+                            log::debug!(
+                                "Skipping repeated dead proposal for broker {} within cooldown {}ms",
+                                broker_id,
+                                dead_proposal_cooldown_ms
+                            );
+                            continue;
                         }
+                    }
+
+                    log::warn!(
+                        "Broker {} appears dead after {} missed windows (last_seen {}ms ago); electing new leaders",
+                        broker_id,
+                        missed,
+                        elapsed
+                    );
+                    let assignments = compute_failover_assignments(&meta, *broker_id);
+                    if let Err(e) = ctrl_fd
+                        .propose_mark_broker_dead(*broker_id, assignments)
+                        .await
+                    {
+                        log::error!("propose_mark_broker_dead failed: {}", e);
+                    } else {
+                        last_dead_proposal_ms.insert(*broker_id, now_ms);
                     }
                 }
             }
@@ -366,7 +458,7 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
         broker_core.run().await;
     });
 
-    let grpc_server = KafkaBrokerServer::new(rpc_tx);
+    let grpc_server = KafkaBrokerServer::new(rpc_tx, config.membership_api_token.clone());
     let api_addr_str = config.api_addr.clone();
     tokio::spawn(async move {
         if let Err(e) = grpc_server.run(&api_addr_str).await {
@@ -381,10 +473,17 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
     if let Some(join_addr) = config.join_addr.clone() {
         use crate::api::broker::AddNodeRequest;
         use crate::client::kafka_broker_client::{KafkaBrokerClient, KafkaBrokerClientTrait};
+        use tonic::metadata::MetadataValue;
         let api_addr = config.api_addr.clone();
         let rpc_addr = config.rpc_addr.clone();
+        let membership_api_token = config.membership_api_token.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if !wait_for_local_listener(&api_addr, 10_000).await {
+                log::warn!(
+                    "Local API listener {} was not reachable before join attempts; proceeding anyway",
+                    api_addr
+                );
+            }
             let mut target = join_addr.clone();
             let max_attempts = 10u32;
             for attempt in 1..=max_attempts {
@@ -393,19 +492,32 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
                         log::warn!("Attempt {}/{}: cannot connect to {}: {}", attempt, max_attempts, target, e);
                     }
                     Ok(client) => {
-                        let req = tonic::Request::new(AddNodeRequest {
+                        let mut req = tonic::Request::new(AddNodeRequest {
                             node_id,
                             api_addr: api_addr.clone(),
                             rpc_addr: rpc_addr.clone(),
                         });
+                        if let Some(token) = membership_api_token.as_deref() {
+                            match MetadataValue::try_from(token) {
+                                Ok(value) => {
+                                    req.metadata_mut().insert("x-rustmq-admin-token", value);
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Invalid membership_api_token for AddNode metadata: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
                         match client.add_node(req).await {
                             Ok(resp) if resp.error_code == 0 => {
                                 log::info!("Successfully joined KRaft cluster via {}", target);
                                 return;
                             }
-                            Ok(resp) if resp.error_code == 6 && !resp.error_message.is_empty() => {
-                                log::info!("Redirecting AddNode to controller at {}", resp.error_message);
-                                target = resp.error_message.clone();
+                            Ok(resp) if resp.error_code == 6 && !resp.leader_addr.is_empty() => {
+                                log::info!("Redirecting AddNode to controller at {}", resp.leader_addr);
+                                target = resp.leader_addr.clone();
                                 continue;
                             }
                             Ok(resp) => {
@@ -417,7 +529,10 @@ async fn run_kraft_cluster(config: broker::config::BrokerConfig) -> Result<()> {
                         }
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if attempt < max_attempts {
+                    let backoff = jittered_backoff(attempt, 300, 400);
+                    tokio::time::sleep(backoff).await;
+                }
             }
             log::error!("Failed to join KRaft cluster after {} attempts", max_attempts);
         });

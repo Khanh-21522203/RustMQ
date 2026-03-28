@@ -10,6 +10,14 @@ use crate::api::broker::*;
 use crate::client::config::ConsumerConfig;
 use crate::client::kafka_broker_client::{KafkaBrokerClient, KafkaBrokerClientTrait};
 
+const REBALANCE_ERROR_CODE: i32 = 14;
+
+#[derive(Clone)]
+struct GroupSessionState {
+    member_id: String,
+    generation_id: i32,
+}
+
 /// Consumed message
 #[derive(Debug, Clone)]
 pub struct ConsumedMessage {
@@ -76,10 +84,15 @@ impl Consumer {
         self.is_running = true;
 
         // Join group and get partition assignment if consumer group is configured
+        let mut group_session: Option<Arc<Mutex<GroupSessionState>>> = None;
         if let Some(group_id) = &self.config.group_id.clone() {
-            let (assigned, member_id) =
+            let (assigned, member_id, generation_id) =
                 Self::join_and_sync(&self.client, &self.config, group_id, None).await?;
             self.member_id = Some(member_id);
+            group_session = Some(Arc::new(Mutex::new(GroupSessionState {
+                member_id: self.member_id.clone().unwrap_or_default(),
+                generation_id,
+            })));
             if !assigned.is_empty() {
                 self.active_partitions = assigned;
                 log::info!("Group assignment: partitions {:?}", self.active_partitions);
@@ -111,18 +124,26 @@ impl Consumer {
             self.heartbeat_shutdown_tx = Some(hb_shutdown_tx);
             let hb_client = self.client.clone();
             let hb_needs_rejoin = self.needs_rejoin.clone();
+            let hb_session = group_session.clone();
             tokio::spawn(async move {
                 let mut hb_interval = interval(Duration::from_secs(10));
                 loop {
                     tokio::select! {
                         _ = hb_interval.tick() => {
+                            let (hb_member_id, hb_generation_id) = match &hb_session {
+                                Some(session) => session
+                                    .lock()
+                                    .map(|s| (s.member_id.clone(), s.generation_id))
+                                    .unwrap_or((member_id.clone(), 0)),
+                                None => (member_id.clone(), 0),
+                            };
                             let req = Request::new(HeartbeatRequest {
                                 group_id: group_id.clone(),
-                                generation_id: 0, // broker ignores this field
-                                member_id: member_id.clone(),
+                                generation_id: hb_generation_id,
+                                member_id: hb_member_id,
                             });
                             match hb_client.heartbeat(req).await {
-                                Ok(resp) if resp.error_code == 27 => {
+                                Ok(resp) if resp.error_code == REBALANCE_ERROR_CODE => {
                                     log::info!("Heartbeat: REBALANCE_IN_PROGRESS, will rejoin");
                                     hb_needs_rejoin.store(true, Ordering::SeqCst);
                                 }
@@ -145,9 +166,9 @@ impl Consumer {
         let client = self.client.clone();
         let config = self.config.clone();
         let initial_partitions = self.active_partitions.clone();
-        let initial_member_id = self.member_id.clone();
         let needs_rejoin = self.needs_rejoin.clone();
         let partition_offsets = self.partition_offsets.clone();
+        let group_session_for_poll = group_session.clone();
 
         tokio::spawn(async move {
             let mut poll_interval = interval(Duration::from_millis(config.poll_interval_ms));
@@ -159,7 +180,6 @@ impl Consumer {
                 None
             };
             let mut active_partitions = initial_partitions;
-            let mut member_id = initial_member_id;
 
             loop {
                 tokio::select! {
@@ -167,9 +187,17 @@ impl Consumer {
                         // Rejoin if a rebalance was detected by the heartbeat task
                         if needs_rejoin.load(Ordering::SeqCst) {
                             if let Some(group_id) = &config.group_id {
-                                match Self::join_and_sync(&client, &config, group_id, member_id.as_deref()).await {
-                                    Ok((new_partitions, new_member_id)) => {
-                                        member_id = Some(new_member_id);
+                                let existing_member_id = group_session_for_poll
+                                    .as_ref()
+                                    .and_then(|session| session.lock().ok().map(|s| s.member_id.clone()));
+                                match Self::join_and_sync(&client, &config, group_id, existing_member_id.as_deref()).await {
+                                    Ok((new_partitions, new_member_id, new_generation_id)) => {
+                                        if let Some(session) = &group_session_for_poll {
+                                            if let Ok(mut state) = session.lock() {
+                                                state.member_id = new_member_id;
+                                                state.generation_id = new_generation_id;
+                                            }
+                                        }
                                         let mut offsets_snapshot = partition_offsets
                                             .lock()
                                             .map(|g| g.clone())
@@ -198,16 +226,26 @@ impl Consumer {
                                 .lock()
                                 .map(|g| g.clone())
                                 .unwrap_or_default();
-                            match Self::fetch_all_partitions(&client, &config, &active_partitions, &offsets_snapshot).await {
+                            match Self::fetch_all_partitions(
+                                &client,
+                                &config,
+                                &active_partitions,
+                                &offsets_snapshot,
+                                config.max_messages_per_poll.max(1),
+                            ).await {
                                 Ok(messages) => {
-                                    if let Ok(mut lock) = partition_offsets.lock() {
-                                        for message in &messages {
-                                            lock.insert(message.partition, message.offset + 1);
-                                        }
-                                    }
                                     for message in messages {
+                                        let partition = message.partition;
+                                        let next_offset = message.offset + 1;
                                         if let Err(e) = handler.handle(message).await {
                                             log::error!("Error handling message: {}", e);
+                                            continue;
+                                        }
+                                        if let Ok(mut lock) = partition_offsets.lock() {
+                                            let entry = lock.entry(partition).or_insert(next_offset);
+                                            if next_offset > *entry {
+                                                *entry = next_offset;
+                                            }
                                         }
                                     }
                                 }
@@ -285,6 +323,7 @@ impl Consumer {
             &self.config,
             &self.active_partitions,
             &offsets_snapshot,
+            self.config.max_messages_per_poll.max(1),
         )
         .await?;
 
@@ -343,16 +382,15 @@ impl Consumer {
     /// Join a consumer group and sync to get partition assignments.
     /// Returns (assigned_partitions, actual_member_id).
     ///
-    /// Retries automatically on `REBALANCE_IN_PROGRESS` (error_code 27) so
+    /// Retries automatically on `REBALANCE_IN_PROGRESS` (error_code 14) so
     /// callers don't need to handle transient rebalance windows themselves.
     async fn join_and_sync(
         client: &KafkaBrokerClient,
         config: &ConsumerConfig,
         group_id: &str,
         existing_member_id: Option<&str>,
-    ) -> Result<(Vec<i32>, String)> {
+    ) -> Result<(Vec<i32>, String, i32)> {
         const MAX_ATTEMPTS: u32 = 5;
-        const REBALANCE_ERROR: i32 = 27;
 
         let mut member_id = existing_member_id
             .map(|s| s.to_string())
@@ -386,7 +424,7 @@ impl Consumer {
                 .await
                 .map_err(|e| anyhow::anyhow!("JoinGroup failed: {}", e))?;
 
-            if join_resp.error_code == REBALANCE_ERROR {
+            if join_resp.error_code == REBALANCE_ERROR_CODE {
                 continue;
             }
             if join_resp.error_code != 0 {
@@ -410,7 +448,7 @@ impl Consumer {
                 .await
                 .map_err(|e| anyhow::anyhow!("SyncGroup failed: {}", e))?;
 
-            if sync_resp.error_code == REBALANCE_ERROR {
+            if sync_resp.error_code == REBALANCE_ERROR_CODE {
                 continue;
             }
             if sync_resp.error_code != 0 {
@@ -423,7 +461,7 @@ impl Consumer {
             } else {
                 bincode::deserialize(&sync_resp.member_assignment).unwrap_or_default()
             };
-            return Ok((partitions, actual_member_id));
+            return Ok((partitions, actual_member_id, generation_id));
         }
 
         anyhow::bail!(
@@ -515,6 +553,7 @@ impl Consumer {
         config: &ConsumerConfig,
         partitions: &[i32],
         offsets: &HashMap<i32, i64>,
+        max_messages_per_poll: usize,
     ) -> Result<Vec<ConsumedMessage>> {
         let partition_data: Vec<fetch_request::PartitionData> = partitions
             .iter()
@@ -538,7 +577,7 @@ impl Consumer {
         let response = client.fetch(request).await?;
         let mut messages = Vec::new();
 
-        for topic_result in response.topics {
+        'topic_loop: for topic_result in response.topics {
             for partition_result in topic_result.partitions {
                 if partition_result.error_code != 0 {
                     continue;
@@ -552,6 +591,9 @@ impl Consumer {
                         value: record.value,
                         timestamp: None,
                     });
+                    if messages.len() >= max_messages_per_poll {
+                        break 'topic_loop;
+                    }
                 }
             }
         }

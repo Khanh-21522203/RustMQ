@@ -50,7 +50,9 @@ pub struct ControllerRaftNode {
     leader_id: Arc<AtomicU64>,
     peers: Arc<std::sync::RwLock<HashMap<u64, PeerInfo>>>,
     pending_replies: HashMap<u64, oneshot::Sender<anyhow::Result<()>>>,
+    pending_enqueued_ms: HashMap<u64, u64>,
     pending_cc_reply: Option<oneshot::Sender<anyhow::Result<()>>>,
+    pending_cc_enqueued_ms: Option<u64>,
     next_proposal_id: u64,
     db: Option<Arc<sled::Db>>,
     #[allow(dead_code)]
@@ -157,7 +159,9 @@ impl ControllerRaftNode {
             leader_id: leader_id.clone(),
             peers: peers.clone(),
             pending_replies: HashMap::new(),
+            pending_enqueued_ms: HashMap::new(),
             pending_cc_reply: None,
+            pending_cc_enqueued_ms: None,
             next_proposal_id: 1,
             db,
             logger,
@@ -198,6 +202,13 @@ impl ControllerRaftNode {
                                 let _ = reply_tx.send(Err(anyhow::anyhow!("{:?}", e)));
                             } else {
                                 self.pending_replies.insert(proposal_id, reply_tx);
+                                self.pending_enqueued_ms.insert(proposal_id, now_ms_u64());
+                                if self.pending_replies.len() > 128 {
+                                    log::warn!(
+                                        "Controller proposal backlog is high: {} pending",
+                                        self.pending_replies.len()
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -215,7 +226,10 @@ impl ControllerRaftNode {
                         continue;
                     }
                     match self.raw_node.propose_conf_change(vec![], cc) {
-                        Ok(_) => { self.pending_cc_reply = Some(reply_tx); }
+                        Ok(_) => {
+                            self.pending_cc_reply = Some(reply_tx);
+                            self.pending_cc_enqueued_ms = Some(now_ms_u64());
+                        }
                         Err(e) => { let _ = reply_tx.send(Err(anyhow::anyhow!("{:?}", e))); }
                     }
                 }
@@ -307,7 +321,29 @@ impl ControllerRaftNode {
     async fn apply_entry_data(&mut self, data: &[u8]) {
         if let Ok(proposal) = bincode::deserialize::<ControllerProposal>(data) {
             let id = proposal.proposal_id;
+            let started = now_ms_u64();
             self.apply_command(proposal.command).await;
+            let apply_ms = now_ms_u64().saturating_sub(started);
+            let queue_ms = self
+                .pending_enqueued_ms
+                .remove(&id)
+                .map(|t| started.saturating_sub(t))
+                .unwrap_or(0);
+            if queue_ms > 1_000 || apply_ms > 200 {
+                log::warn!(
+                    "Controller proposal {} latency: queue={}ms apply={}ms",
+                    id,
+                    queue_ms,
+                    apply_ms
+                );
+            } else {
+                log::debug!(
+                    "Controller proposal {} latency: queue={}ms apply={}ms",
+                    id,
+                    queue_ms,
+                    apply_ms
+                );
+            }
             if let Some(tx) = self.pending_replies.remove(&id) {
                 let _ = tx.send(Ok(()));
             }
@@ -332,6 +368,7 @@ impl ControllerRaftNode {
                 if let Some(tx) = self.pending_cc_reply.take() {
                     let _ = tx.send(Err(anyhow::anyhow!("decode failed: {}", e)));
                 }
+                self.pending_cc_enqueued_ms = None;
                 return;
             }
         };
@@ -343,6 +380,7 @@ impl ControllerRaftNode {
                 if let Some(tx) = self.pending_cc_reply.take() {
                     let _ = tx.send(Err(anyhow::anyhow!("{:?}", e)));
                 }
+                self.pending_cc_enqueued_ms = None;
                 return;
             }
         };
@@ -387,14 +425,30 @@ impl ControllerRaftNode {
         if let Some(tx) = self.pending_cc_reply.take() {
             let _ = tx.send(Ok(()));
         }
+        if let Some(enqueued_ms) = self.pending_cc_enqueued_ms.take() {
+            let total_ms = now_ms_u64().saturating_sub(enqueued_ms);
+            if total_ms > 1_000 {
+                log::warn!("Controller conf change latency: {}ms", total_ms);
+            } else {
+                log::debug!("Controller conf change latency: {}ms", total_ms);
+            }
+        }
     }
 
     fn fail_pending_replies(&mut self, reason: &str) {
         let pending = std::mem::take(&mut self.pending_replies);
+        self.pending_enqueued_ms.clear();
         for (_, tx) in pending {
             let _ = tx.send(Err(anyhow::anyhow!(reason.to_string())));
         }
     }
+}
+
+fn now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 // ── ControllerStorage ─────────────────────────────────────────────────────────

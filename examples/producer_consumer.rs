@@ -102,6 +102,7 @@ async fn main() -> Result<()> {
         auto_commit: true,
         auto_commit_interval_ms: 5000,
         poll_interval_ms: 500,
+        max_messages_per_poll: 1000,
     };
 
     let message_counter = Arc::new(AtomicUsize::new(0));
@@ -212,7 +213,7 @@ async fn start_broker(addr: &str) -> Result<()> {
     });
 
     // Create and start gRPC server
-    let grpc_server = KafkaBrokerServer::new(rpc_tx);
+    let grpc_server = KafkaBrokerServer::new(rpc_tx, None);
 
     // Convert addr to String for 'static lifetime
     let addr_owned = addr.to_string();

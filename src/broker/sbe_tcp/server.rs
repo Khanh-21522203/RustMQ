@@ -13,6 +13,12 @@ use raft::eraftpb::Message;
 
 use super::codec;
 
+const MAX_FRAME_SIZE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
+fn frame_too_large(payload_len: usize) -> bool {
+    payload_len > MAX_FRAME_SIZE_BYTES
+}
+
 /// Bind to `addr` and push decoded Raft messages into `step_tx`.
 pub struct SbeTcpServer {
     pub step_tx: mpsc::UnboundedSender<Message>,
@@ -60,6 +66,14 @@ async fn handle_peer(mut stream: TcpStream, step_tx: mpsc::UnboundedSender<Messa
             }
         }
         let payload_len = u32::from_le_bytes(len_buf) as usize;
+        if frame_too_large(payload_len) {
+            log::warn!(
+                "[sbe-tcp] frame too large ({} > {}), closing connection",
+                payload_len,
+                MAX_FRAME_SIZE_BYTES
+            );
+            return;
+        }
 
         // Read payload
         let mut payload = vec![0u8; payload_len];
@@ -81,5 +95,16 @@ async fn handle_peer(mut stream: TcpStream, step_tx: mpsc::UnboundedSender<Messa
                 // Keep connection alive — peer may send valid messages later
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{frame_too_large, MAX_FRAME_SIZE_BYTES};
+
+    #[test]
+    fn max_frame_limit_is_enforced() {
+        assert!(!frame_too_large(MAX_FRAME_SIZE_BYTES));
+        assert!(frame_too_large(MAX_FRAME_SIZE_BYTES + 1));
     }
 }

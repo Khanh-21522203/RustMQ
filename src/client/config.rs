@@ -116,6 +116,11 @@ pub struct ConsumerConfig {
     /// Poll interval in milliseconds
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
+
+    /// Maximum number of records processed per poll cycle.
+    /// Acts as backpressure for both fetch volume and handler throughput.
+    #[serde(default = "default_max_messages_per_poll")]
+    pub max_messages_per_poll: usize,
 }
 
 // Default value functions
@@ -164,6 +169,10 @@ fn default_auto_commit_interval() -> u64 {
 }
 
 fn default_poll_interval() -> u64 {
+    1000
+}
+
+fn default_max_messages_per_poll() -> usize {
     1000
 }
 
@@ -230,6 +239,7 @@ impl AppConfig {
                 auto_commit: false,
                 auto_commit_interval_ms: default_auto_commit_interval(),
                 poll_interval_ms: default_poll_interval(),
+                max_messages_per_poll: default_max_messages_per_poll(),
             }),
         }
     }

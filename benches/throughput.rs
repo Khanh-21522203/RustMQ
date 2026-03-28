@@ -49,7 +49,7 @@ async fn start_benchmark_broker(addr: &str) -> anyhow::Result<()> {
         broker_core.run().await;
     });
 
-    let grpc_server = KafkaBrokerServer::new(rpc_tx);
+    let grpc_server = KafkaBrokerServer::new(rpc_tx, None);
     let addr_owned = addr.to_string();
 
     tokio::spawn(async move {
@@ -200,6 +200,7 @@ fn bench_e2e_latency(c: &mut Criterion) {
                     auto_commit: true,
                     auto_commit_interval_ms: 5000,
                     poll_interval_ms: 10,
+                    max_messages_per_poll: 1000,
                 };
 
                 // Create producer

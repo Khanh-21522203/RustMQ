@@ -20,7 +20,7 @@ Manage dynamic broker membership through `AddNode`/`RemoveNode` RPCs and startup
 
 1. New broker starts with `join_addr` in config.
 2. Node attempts `AddNode` to target API address.
-3. If target is not controller, broker receives redirect (`error_code = 6`, `error_message = leader_addr`) and retries against leader.
+3. If target is not controller, broker receives redirect (`error_code = 6`, `leader_addr`) and retries against leader.
 4. Existing members can remove node with `RemoveNode`.
 
 ### System Flow
@@ -28,20 +28,24 @@ Manage dynamic broker membership through `AddNode`/`RemoveNode` RPCs and startup
 1. Startup path in `run_kraft_cluster` spawns background join task when `join_addr` is set.
 2. Join task tries up to 10 attempts:
 - Connect using `KafkaBrokerClient::new(target)`.
+- Wait for local API listener readiness before first join attempt.
 - Send `AddNodeRequest { node_id, api_addr, rpc_addr }`.
+- Include `x-rustmq-admin-token` metadata when `membership_api_token` is configured.
 - On success (`error_code == 0`) stop.
-- On redirect (`error_code == 6`) replace target and continue.
+- On redirect (`error_code == 6`) replace target with `leader_addr` and continue.
+- Use jittered exponential backoff between retries.
 3. Server path:
 - RPC enters `BrokerRpcRouter::dispatch`.
+- `KafkaBrokerServer` enforces membership auth on `AddNode`/`RemoveNode` when token is configured.
 - `handle_add_node`/`handle_remove_node` call storage `add_node`/`remove_node`.
 - `NOT_LEADER` errors are parsed into redirect responses.
 
 ### Data Model
 
 - `AddNodeRequest { node_id: u64, api_addr: String, rpc_addr: String }`.
-- `AddNodeResponse { error_code: i32, error_message: String }`.
+- `AddNodeResponse { error_code: i32, error_message: String, leader_addr: String }`.
 - `RemoveNodeRequest { node_id: u64 }`.
-- `RemoveNodeResponse { error_code: i32, error_message: String }`.
+- `RemoveNodeResponse { error_code: i32, error_message: String, leader_addr: String }`.
 - Internal error translation uses `BrokerError::from_message` and `leader_addr()`.
 
 Persistence behavior:
@@ -51,7 +55,9 @@ Persistence behavior:
 
 - RPC contracts from [`src/api/kafka.proto`](../src/api/kafka.proto): `AddNode`, `RemoveNode`.
 - Redirect contract used by runtime:
-- `error_code = 6` means caller should retry against `error_message` address.
+- `error_code = 6` means caller should retry against `leader_addr`.
+- Authorization contract:
+- When [`membership_api_token`](../src/broker/config.rs) is set, `AddNode` and `RemoveNode` require `x-rustmq-admin-token` metadata.
 
 ### Dependencies
 
@@ -72,15 +78,10 @@ Persistence behavior:
 
 - Router logs `recv AddNode` and `recv RemoveNode` at info level.
 - Join task logs connection failures, RPC failures, redirects, and final success/failure.
-- Debug redirects by tracing `error_code` and `error_message` in add/remove responses.
+- Debug redirects by tracing `error_code` and `leader_addr` in add/remove responses.
 
 ### Risks and Notes
 
-- `error_message` is overloaded for two meanings: redirect target and free-form error text.
-- No authorization controls on membership RPCs are visible in current code.
+- Membership auth is optional and token-based; clusters that need locked-down membership must configure `membership_api_token`.
 
 Changes:
-
-- Replace overloaded `error_message` redirect signaling with a dedicated `leader_addr` field in add/remove responses.
-- Add authorization checks for `AddNode` and `RemoveNode` operations.
-- Add jittered backoff and readiness checks in the startup join loop.

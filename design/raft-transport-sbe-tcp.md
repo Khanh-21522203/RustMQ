@@ -26,7 +26,7 @@ Transport Raft messages over raw TCP using a custom SBE framing/encoding path.
 
 1. Outbound:
 - `SbeTcpTransport::send_messages` -> `ConnectionManager::send_messages`.
-- Resolve peer address from shared `PeerInfo` map (currently derived from `rpc_addr`).
+- Resolve peer address from shared `PeerInfo` map (`sbe_tcp_addr` first, fallback to stripped `rpc_addr`).
 - Build frame: 4-byte LE payload length + SBE payload.
 - Send via bounded per-peer channel to `writer_task`.
 2. `writer_task`:
@@ -34,7 +34,7 @@ Transport Raft messages over raw TCP using a custom SBE framing/encoding path.
 - Write frames to TCP stream; on error, reconnect.
 3. Inbound server:
 - `SbeTcpServer::serve` accepts peer TCP sockets.
-- `handle_peer` reads length then payload, decodes via `codec::decode`, sends to `step_tx`.
+- `handle_peer` reads length, rejects frames above max size, then reads payload, decodes via `codec::decode`, sends to `step_tx`.
 
 ### Data Model
 
@@ -69,7 +69,7 @@ Persistence behavior:
 - Unknown peer id logs warning and drops message.
 - Send channel full or closed removes cached peer connection.
 - Decode errors on inbound frames are logged and connection stays open for subsequent frames.
-- Inbound frame length has no explicit max-size guard.
+- Inbound frame length above max-size guard is rejected before allocation/decode.
 
 ### Observability and Debugging
 
@@ -78,11 +78,7 @@ Persistence behavior:
 
 ### Risks and Notes
 
-- `PeerInfo.sbe_tcp_addr` is present but outbound currently strips/uses `rpc_addr`; separate SBE endpoint configuration is effectively unused.
+- `PeerInfo.sbe_tcp_addr` is now used as the primary outbound SBE address.
 - No TLS/authentication at transport layer in current implementation.
 
 Changes:
-
-- Use `PeerInfo.sbe_tcp_addr` as the primary outbound address instead of deriving from `rpc_addr`.
-- Add maximum frame-size enforcement before payload allocation/decode.
-- Add optional TLS/authentication support for inter-node TCP transport.

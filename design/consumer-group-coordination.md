@@ -72,8 +72,9 @@ Persistence behavior:
 ### Failure Modes and Edge Cases
 
 - Unknown group/member produces `BrokerError::NotFound` -> core maps to generic error code `1`.
-- Rebalance in progress maps to error code `27` in core for sync/heartbeat.
-- `generation_id`, `protocol_type`, and `group_assignment` are minimally used in current implementation.
+- Rebalance in progress maps to `REBALANCE_IN_PROGRESS = 14` in core for sync/heartbeat.
+- `generation_id` is validated in `SyncGroup`/`Heartbeat` and mismatches return validation errors.
+- `JoinGroup` validates `protocol_type == "consumer"` and requires non-empty protocol metadata.
 - Membership expiry is timer-driven; abrupt disconnects remain until timeout/leave.
 
 ### Observability and Debugging
@@ -85,10 +86,9 @@ Persistence behavior:
 ### Risks and Notes
 
 - Group coordination logic exists in both `consumer_group.rs` and `storage/traits.rs`; duplication can diverge.
-- Rebalance error code in core (`27`) does not match `REBALANCE_IN_PROGRESS = 14` in `kafka.proto` enum.
+- Rebalance error-code mapping now matches `kafka.proto` enum value `14`.
 
 Changes:
 
-- Align rebalance error mapping with `kafka.proto` (`REBALANCE_IN_PROGRESS = 14`) across broker and client paths.
 - Consolidate duplicated group-state logic into a single coordinator implementation to avoid divergence.
-- Enforce `generation_id` and protocol validation for `JoinGroup`, `SyncGroup`, and `Heartbeat`.
+  > Blocked: group state and rebalance logic currently exist in both [`src/broker/server/consumer_group.rs`](../src/broker/server/consumer_group.rs) and [`src/broker/storage/traits.rs`](../src/broker/storage/traits.rs), with separate background tasks and storage coupling. Consolidating safely needs a design choice: (1) make `InMemoryStorage` delegate to `ConsumerGroupCoordinator` and remove duplicated state fields from `InnerStorage`; or (2) extract shared pure state-machine helpers and keep two storage owners. This cycle implemented protocol/generation validation and error-code alignment, but did not perform the cross-module consolidation refactor.

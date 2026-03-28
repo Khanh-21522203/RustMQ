@@ -202,6 +202,29 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                                 value: m.value,
                             })
                             .collect();
+
+                        if request.replica_id > 0 {
+                            let fetched_until = partition_data.fetch_offset + records.len() as i64;
+                            if let Err(e) = self
+                                .storage
+                                .record_replica_fetch(
+                                    &topic_data.topic_name,
+                                    partition_data.partition,
+                                    request.replica_id as u64,
+                                    fetched_until,
+                                )
+                                .await
+                            {
+                                log::warn!(
+                                    "Failed to record replica fetch progress {} {}-{}: {}",
+                                    request.replica_id,
+                                    topic_data.topic_name,
+                                    partition_data.partition,
+                                    e
+                                );
+                            }
+                        }
+
                         partition_results.push(fetch_response::PartitionResult {
                             partition: partition_data.partition,
                             error_code: 0,
@@ -348,7 +371,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                 member_assignment,
             },
             Err(BrokerError::RebalanceInProgress) => SyncGroupResponse {
-                error_code: 27,
+                error_code: 14,
                 member_assignment: Vec::new(),
             },
             Err(e) => {
@@ -368,7 +391,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
             .await
         {
             Ok(_) => HeartbeatResponse { error_code: 0 },
-            Err(BrokerError::RebalanceInProgress) => HeartbeatResponse { error_code: 27 },
+            Err(BrokerError::RebalanceInProgress) => HeartbeatResponse { error_code: 14 },
             Err(e) => {
                 log::error!("Heartbeat failed: {}", e);
                 HeartbeatResponse { error_code: 1 }
@@ -444,6 +467,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
             Ok(_) => AddNodeResponse {
                 error_code: 0,
                 error_message: String::new(),
+                leader_addr: String::new(),
             },
             Err(e) => {
                 let msg = e.to_string();
@@ -464,13 +488,15 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                     };
                     AddNodeResponse {
                         error_code: 6, // NOT_LEADER_FOR_PARTITION — redirect hint
-                        error_message: leader_addr,
+                        error_message: "NOT_LEADER_FOR_PARTITION".to_string(),
+                        leader_addr,
                     }
                 } else {
                     log::error!("Failed to add node: {}", msg);
                     AddNodeResponse {
                         error_code: 1,
                         error_message: msg,
+                        leader_addr: String::new(),
                     }
                 }
             }
@@ -482,6 +508,7 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
             Ok(_) => RemoveNodeResponse {
                 error_code: 0,
                 error_message: String::new(),
+                leader_addr: String::new(),
             },
             Err(e) => {
                 let msg = e.to_string();
@@ -501,13 +528,15 @@ impl<S: BrokerStorage + 'static> BrokerCore<S> {
                     };
                     RemoveNodeResponse {
                         error_code: 6,
-                        error_message: leader_addr,
+                        error_message: "NOT_LEADER_FOR_PARTITION".to_string(),
+                        leader_addr,
                     }
                 } else {
                     log::error!("Failed to remove node: {}", msg);
                     RemoveNodeResponse {
                         error_code: 1,
                         error_message: msg,
+                        leader_addr: String::new(),
                     }
                 }
             }

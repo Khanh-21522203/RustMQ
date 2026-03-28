@@ -49,6 +49,11 @@ pub struct BrokerConfig {
     /// Must be <= the number of live brokers; clamped automatically otherwise.
     #[serde(default = "default_replication_factor")]
     pub default_replication_factor: u16,
+
+    /// Optional shared token required for AddNode/RemoveNode RPCs.
+    /// When set, clients must provide `x-rustmq-admin-token` metadata.
+    #[serde(default)]
+    pub membership_api_token: Option<String>,
 }
 
 /// Cluster configuration
@@ -87,31 +92,70 @@ pub struct RetentionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaftConfig {
     /// Heartbeat interval in milliseconds
+    #[serde(default = "default_raft_heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u64,
 
     /// Minimum election timeout in milliseconds
+    #[serde(default = "default_election_timeout_min_ms")]
     pub election_timeout_min_ms: u64,
 
     /// Maximum election timeout in milliseconds
+    #[serde(default = "default_election_timeout_max_ms")]
     pub election_timeout_max_ms: u64,
 
     /// Snapshot threshold (number of logs before snapshot)
+    #[serde(default = "default_snapshot_threshold")]
     pub snapshot_threshold: u64,
 
     /// How long to wait for all members to rejoin before forcing rebalance finalization (ms)
     #[serde(default = "default_rebalance_timeout_ms")]
     pub rebalance_timeout_ms: i64,
 
+    /// Interval for broker heartbeat proposals to controller metadata (ms).
+    #[serde(default = "default_broker_heartbeat_propose_interval_ms")]
+    pub broker_heartbeat_propose_interval_ms: u64,
+
+    /// How often the controller scans for dead brokers (ms).
+    #[serde(default = "default_failure_detector_interval_ms")]
+    pub failure_detector_interval_ms: u64,
+
+    /// A broker is considered missed when `now - last_seen_ms` exceeds this threshold (ms).
+    #[serde(default = "default_dead_broker_threshold_ms")]
+    pub dead_broker_threshold_ms: u64,
+
+    /// Number of consecutive missed detector windows before proposing MarkBrokerDead.
+    #[serde(default = "default_dead_broker_consecutive_misses")]
+    pub dead_broker_consecutive_misses: u32,
+
+    /// Minimum time between repeated dead-broker proposals for the same broker (ms).
+    #[serde(default = "default_dead_broker_proposal_cooldown_ms")]
+    pub dead_broker_proposal_cooldown_ms: u64,
+
+    /// Interval for ISR reconciliation ticks (ms).
+    #[serde(default = "default_isr_tick_interval_ms")]
+    pub isr_tick_interval_ms: u64,
+
+    /// Minimum interval between repeated ISR change proposals per partition (ms).
+    #[serde(default = "default_isr_proposal_min_interval_ms")]
+    pub isr_proposal_min_interval_ms: u64,
 }
 
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
-            heartbeat_interval_ms: 1000,
-            election_timeout_min_ms: 3000,
-            election_timeout_max_ms: 6000,
-            snapshot_threshold: 10000,
+            heartbeat_interval_ms: default_raft_heartbeat_interval_ms(),
+            election_timeout_min_ms: default_election_timeout_min_ms(),
+            election_timeout_max_ms: default_election_timeout_max_ms(),
+            snapshot_threshold: default_snapshot_threshold(),
             rebalance_timeout_ms: default_rebalance_timeout_ms(),
+            broker_heartbeat_propose_interval_ms:
+                default_broker_heartbeat_propose_interval_ms(),
+            failure_detector_interval_ms: default_failure_detector_interval_ms(),
+            dead_broker_threshold_ms: default_dead_broker_threshold_ms(),
+            dead_broker_consecutive_misses: default_dead_broker_consecutive_misses(),
+            dead_broker_proposal_cooldown_ms: default_dead_broker_proposal_cooldown_ms(),
+            isr_tick_interval_ms: default_isr_tick_interval_ms(),
+            isr_proposal_min_interval_ms: default_isr_proposal_min_interval_ms(),
         }
     }
 }
@@ -121,6 +165,50 @@ pub const DEFAULT_REBALANCE_TIMEOUT_MS: i64 = 30_000;
 
 fn default_rebalance_timeout_ms() -> i64 {
     DEFAULT_REBALANCE_TIMEOUT_MS
+}
+
+fn default_raft_heartbeat_interval_ms() -> u64 {
+    1000
+}
+
+fn default_election_timeout_min_ms() -> u64 {
+    3000
+}
+
+fn default_election_timeout_max_ms() -> u64 {
+    6000
+}
+
+fn default_snapshot_threshold() -> u64 {
+    10_000
+}
+
+fn default_broker_heartbeat_propose_interval_ms() -> u64 {
+    3000
+}
+
+fn default_failure_detector_interval_ms() -> u64 {
+    5000
+}
+
+fn default_dead_broker_threshold_ms() -> u64 {
+    15_000
+}
+
+fn default_dead_broker_consecutive_misses() -> u32 {
+    2
+}
+
+fn default_dead_broker_proposal_cooldown_ms() -> u64 {
+    30_000
+}
+
+fn default_isr_tick_interval_ms() -> u64 {
+    500
+}
+
+fn default_isr_proposal_min_interval_ms() -> u64 {
+    1000
 }
 
 fn default_node_id() -> u64 {
@@ -173,6 +261,7 @@ impl BrokerConfig {
             transport: default_transport(),
             join_addr: None,
             default_replication_factor: default_replication_factor(),
+            membership_api_token: None,
         }
     }
 

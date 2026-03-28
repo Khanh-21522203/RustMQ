@@ -3,19 +3,25 @@ use crate::api::requests::BrokerGrpcRequest;
 use crate::api::responses::BrokerGrpcResponse;
 use async_trait::async_trait;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 pub struct KafkaBrokerServer {
     rpc_send_channel: mpsc::Sender<(BrokerGrpcRequest, oneshot::Sender<BrokerGrpcResponse>)>,
+    membership_api_token: Option<Arc<str>>,
 }
 
 impl KafkaBrokerServer {
     pub fn new(
         rpc_send_channel: mpsc::Sender<(BrokerGrpcRequest, oneshot::Sender<BrokerGrpcResponse>)>,
+        membership_api_token: Option<String>,
     ) -> Self {
-        KafkaBrokerServer { rpc_send_channel }
+        KafkaBrokerServer {
+            rpc_send_channel,
+            membership_api_token: membership_api_token.map(Arc::<str>::from),
+        }
     }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<(), tonic::transport::Error> {
@@ -29,6 +35,26 @@ impl KafkaBrokerServer {
     pub async fn run(self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         let endpoint_addr: SocketAddr = addr.parse()?;
         self.serve(endpoint_addr).await?;
+        Ok(())
+    }
+
+    fn enforce_membership_auth<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let Some(expected) = &self.membership_api_token else {
+            return Ok(());
+        };
+
+        let value = request
+            .metadata()
+            .get("x-rustmq-admin-token")
+            .ok_or_else(|| Status::unauthenticated("missing x-rustmq-admin-token"))?;
+        let provided = value
+            .to_str()
+            .map_err(|_| Status::unauthenticated("invalid x-rustmq-admin-token encoding"))?;
+        if provided != expected.as_ref() {
+            return Err(Status::permission_denied(
+                "invalid token for membership operation",
+            ));
+        }
         Ok(())
     }
 }
@@ -142,6 +168,7 @@ impl broker_server::Broker for KafkaBrokerServer {
         &self,
         request: Request<AddNodeRequest>,
     ) -> Result<Response<AddNodeResponse>, Status> {
+        self.enforce_membership_auth(&request)?;
         dispatch!(self, AddNode, request)
     }
 
@@ -149,6 +176,7 @@ impl broker_server::Broker for KafkaBrokerServer {
         &self,
         request: Request<RemoveNodeRequest>,
     ) -> Result<Response<RemoveNodeResponse>, Status> {
+        self.enforce_membership_auth(&request)?;
         dispatch!(self, RemoveNode, request)
     }
 }
